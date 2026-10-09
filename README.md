@@ -1,71 +1,66 @@
-# VC6ai
+# XP-Harness-Desktop
 
-An AI agent that runs on Windows XP et al.
+VC6AI 的极简 Windows 原生桌面版。基于 [bcsongor/vc6ai](https://github.com/bcsongor/vc6ai)，保留其 C 代码、OpenRouter 接口、会话管理、单一 `cmd` 工具、cJSON 和随附的 libcurl；仅增加桌面窗口与 Named Pipe 通信。
 
-<img width="797" height="600" alt="image" src="https://github.com/user-attachments/assets/cd0d9eb3-d3fe-4c6a-83e5-b091bfd4597d" />
+上游基线：`f99d2f2ec459dff38b5afe89ff0d8a38cf952972`。原 MIT 许可证和第三方 NOTICE 均保留。
 
-I built this over a weekend. It's about 1100 lines of C, it compiles with Visual C++ 6 and it runs happily on a Windows Server 2003 box that has no business running anything from this decade. It talks to an LLM and it has exactly one tool.
-
-## Why
-
-The last couple of years gave us a plethora of agent frameworks, with a lot of them raising silly amount of VC money.
-Most of that effort went into complex harnesses: special tools, strict schemas, MCP servers, etc. 
-Supposedly all this scaffolding helps the model.
-
-Today it feels these harnesses mostly get in the way. Every extra tool is more ambiguity for the model, more definitions stuffed into the context window and a bigger bill at the end.
-
-Here's the thing though: modern models (released in 2026 and later) are already really good at using a shell.
-Give one a command line and it will write files, (rip)grep through them, hit an API with curl, compile code, whatever. It doesn't need a custom tool for each of those. 
-
-One tool: run a command.
-
-## Rules I set for myself
-
-A few (daft) self-imposed constraints:
-
-- ~~Keep it under 1000 lines~~ of C89ish (VC6 is not known for standards conformity). *[update: turns out it's better to have more lines and prompt caching than a £1000 bill]*
-- One tool only: the model can run a `cmd.exe` command and nothing else.
-- It has to run on a toaster i.e. my Windows Server 2003 R2 VM.
-- No LLMs for *most* of development, *nearly* every line of code is handwritten, bringing joy. *[update: the sys prompt and tool definition are LLM written, and in my defence, writing instructions for the machine myself sounded suspiciously like work]*
-
-## Getting it running
-
-You'll need Visual C++ 6 to build it, libcurl (provided) and an OpenRouter API key. An Exa API key is optional for web search and fetching.
-
-Copy `vc6ai.sample.ini` to `vc6ai.ini` and set the OpenRouter API key.
-
-```ini
-[OpenRouter]
-ApiKey=sk-or-v1-...
-Model=deepseek/deepseek-v4-flash
-Provider=Fireworks
-Effort=xhigh
-DataCollection=0
-ZeroDataRetention=0
-
-[Exa]
-ApiKey=your-exa-key
+```text
+XP-Harness-Desktop.exe                 AgentCore.exe
+Win32 原生控件  ← JSON →  原 VC6AI Agent 循环
+               Named Pipe       ↓
+                          libcurl / OpenRouter
+                                ↓
+                            cmd.exe 工具
 ```
 
-Any cheap current-gen model does the job (works extremely well with GLM-5.2!).
-`Provider` is optional and pins a single provider on OpenRouter (fallbacks get disabled). `Effort` sets the reasoning effort.
-`DataCollection=0` excludes providers that may store prompts or train on them.
-`ZeroDataRetention=1` is stricter and permits only endpoints that retain no prompts at all. It may exclude endpoints that support prompt caching.
+## MVP 范围
 
-You can get an Exa API key [here](https://dashboard.exa.ai/api-keys). When configured, the model can use Exa to discover pages and fetch clean content from known URLs.
+- 纯 Win32 聊天窗口、Unicode 输入与回复、工具调用状态。
+- 独立 AgentCore，后台请求不会阻塞窗口。
+- 发送、新对话、停止、配置入口；Ctrl+Enter 发送。
+- 配置沿用 `vc6ai.ini`，用系统记事本编辑。
+- `AgentCore.exe` 不带参数仍是上游命令行模式。
 
-Build it in VC6, run the exe and it'll ask you for a prompt. Sometimes it wanders off, but it gets there often enough to be genuinely useful, which surprised me for something this small.
+对话仅保存在内存。停止会结束本窗口启动的 Core，下次发送创建新会话。Markdown 暂按文本显示。Memory、Skill、DLL 插件、托盘、拖放和 Explorer 集成均不在本次 MVP 内。
 
-Slash commands:
+## 构建与运行
 
-| Command | What it does |
+目标构建工具为 Visual C++ 6.0 SP6，目标系统为 Windows XP SP3 x86。使用 VC6 命令提示符（先运行其 `VCVARS32.BAT`）：
+
+```bat
+build.bat
+dist\XP-Harness-Desktop.exe
+```
+
+构建脚本生成 `dist\XP-Harness-Desktop.exe`、`dist\AgentCore.exe`，并复制 libcurl、CA 证书、配置样例和上游工具。不需要 MFC、Electron、Node.js 或 Python 运行时。
+
+点击 **Settings** 编辑 `dist\vc6ai.ini`：填写 `[OpenRouter]` 下的 `ApiKey` 与你有权限使用的 `Model`。Provider、Effort 等配置与上游相同。保存后停止当前 Core，再发送消息以重新载入配置。不要提交含密钥的 INI 文件。
+
+上游附带的 libcurl 使用 OpenSSL；这里保留证书验证与 CA 文件，不改用 Windows 系统 TLS。实际联网能力仍需在目标 XP 机器验证。不要仅凭 `_WIN32_WINNT` 或 PE 子系统版本判断兼容性。
+
+工作目录为应用所在目录；继承的 `cmd` 工具会以当前用户权限执行命令，并非沙箱。聊天文本经 UTF-8 管道传输；目录提示已转换为 UTF-8。工具命令、stdin 和输出仍沿用上游编码，MVP 文件工具仅支持 ASCII 路径与文本命令，建议安装到 `C:\XP-Harness-Desktop`。工具输出捕获上限为 4 MiB，超限结束该命令（exit 122）。
+
+## 代码位置
+
+| 文件 | 职责 |
 | --- | --- |
-| `/model` | Show the current model |
-| `/model <name>` | Switch models mid-session, e.g. `/model z-ai/glm-5.2` |
-| `/stats` | Show session stats |
-| `/new` | Start a fresh conversation |
-| `/exit` | Quit |
+| `src/main.c` | 复用上游模型、工具、会话与 CLI，补充必要校验 |
+| `src/agent_mode.inc` | 桌面模式入口，复用同一份 Agent 实现 |
+| `src/desktop.c` | 一个 Win32 窗口与后台通信线程 |
+| `src/ipc.c` / `src/ipc.h` | 长度前缀、256 KiB 上限、可取消 I/O、当前登录会话 ACL |
+| `src/cJSON.*` / `dep/` | 上游依赖 |
 
-Prefix a line with `!` to run a command via cmd.exe. Ctrl-C aborts a request that's taking too long.
+IPC 为 4 字节小端长度加 UTF-8 JSON；单连接、单次请求。请求类型为 `chat`（带 `text`）、`reset`、`shutdown`；事件类型为 `status`、`assistant`、`tool`、`error`、`done`。这是内部 MVP 协议，不引入通用 RPC 或插件协议。
 
-*Enjoy!*
+## 验证
+
+现代 Windows 开发机可用 Zig 0.13.0 做 x86 宿主机检查：
+
+```powershell
+& .\tests\build-host.ps1 -Zig 'C:\tools\zig\zig.exe'
+python tests\smoke.py build\host\AgentCore.exe
+```
+
+这些测试不需要 API Key，不请求模型、不运行工具命令，覆盖响应校验与真实 Named Pipe 通信。`build\host` 是开发验证产物，不是经过认证的 XP 发布包。
+
+当前验证结果见 [VALIDATION.md](VALIDATION.md)。

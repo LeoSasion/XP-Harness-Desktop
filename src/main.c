@@ -10,11 +10,17 @@
 
 #include <curl/curl.h>
 #include "cJSON.h"
+#include "ipc.h"
+#ifndef JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+#define JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE 0x00002000
+#endif
 
 #pragma comment(lib, "libcurl")
 
-#define DEBUG_REQUESTS
-#define DEBUG_TOOLS
+/* Define DEBUG_REQUESTS / DEBUG_TOOLS explicitly for opt-in sensitive logs. */
+static HANDLE agent_pipe = INVALID_HANDLE_VALUE, agent_parent = NULL;
+static int agent_broken;
+static void agent_emit(const char *type, const char *text);
 
 //////////////////////////////////////////////////////////////////////////
 //
@@ -35,6 +41,7 @@ static void dbg(FILE **fp, const char *filename, const char *fmt, ...) {
     va_list args;
 
     if (!*fp) *fp = fopen(filename, "a");
+    if (!*fp) return;
     
     va_start(args, fmt);
     vfprintf(*fp, fmt, args);
@@ -146,7 +153,8 @@ void term_init(void) {
 }
 
 int term_interrupted(void) {
-    return term_interrupted_flag != 0;
+    return term_interrupted_flag != 0 || agent_broken ||
+        (agent_parent && WaitForSingleObject(agent_parent, 0) == WAIT_OBJECT_0);
 }
 
 void term_interrupt_reset(void) {
@@ -254,9 +262,12 @@ struct http_context_t {
 
 static size_t http_write_callback(char *data, size_t size, size_t nmemb, void *userdata) {
     struct http_context_t *ctx = (struct http_context_t *)userdata;
-    size_t realsize = size * nmemb;
-
-    char *ptr = realloc(ctx->res, ctx->reslen + realsize + 1);
+    size_t realsize;
+    char *ptr;
+    if (size && nmemb > (size_t)-1 / size) return 0;
+    realsize = size * nmemb;
+    if (realsize > 4 * 1024 * 1024UL || ctx->reslen > 4 * 1024 * 1024UL - realsize) return 0;
+    ptr = realloc(ctx->res, ctx->reslen + realsize + 1);
     if (!ptr) return 0;
 
     ctx->res = ptr;
@@ -382,10 +393,17 @@ char *tool_handle_run_cmd(const char *cwd, const char *cmd, const char *input) {
     // we only read once so a noisy command won't block
 #define DRAIN_OUTPUT(outread, out, outsize, outlen) do {                               \
     DWORD drained;                                                                     \
+    char *grown;                                                                       \
+    if (exitcode != STILL_ACTIVE) break;                                               \
     if (PeekNamedPipe((outread), NULL, 0, NULL, &drained, NULL) && drained) {          \
+        if (drained > 4UL * 1024 * 1024 - (outlen) - 32) {                             \
+            exitcode = 122; TerminateJobObject(job, exitcode); break;                  \
+        }                                                                             \
         if ((outlen) + drained + 32 > (outsize)) {                                     \
             while ((outlen) + drained + 32 > (outsize)) (outsize) *= 2;                \
-            (out) = realloc((out), (outsize));                                         \
+            grown = realloc((out), (outsize));                                         \
+            if (!grown) { exitcode = 8; TerminateJobObject(job, exitcode); break; }     \
+            (out) = grown;                                                             \
         }                                                                              \
         if (ReadFile((outread), (out) + (outlen), drained, &drained, NULL) && drained) \
             (outlen) += drained;                                                       \
@@ -393,19 +411,24 @@ char *tool_handle_run_cmd(const char *cwd, const char *cmd, const char *input) {
 } while (0)
 
     SECURITY_ATTRIBUTES sa = {sizeof(SECURITY_ATTRIBUTES), NULL, TRUE};
-    HANDLE outread, outwrite, inread, inwrite, job;
+    HANDLE outread = NULL, outwrite = NULL, inread = NULL, inwrite = NULL, job;
     STARTUPINFO si = {0};
     PROCESS_INFORMATION pi = {0};
+    JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits = {0};
+    char cmdpath[MAX_PATH];
     char *cmdline, buf[1024], *out;
     size_t outsize = 4096, outlen = 0;
     DWORD readlen, exitcode = STILL_ACTIVE, started;
     BOOL ok;
 
-    CreatePipe(&outread, &outwrite, &sa, 0);
+    if (!CreatePipe(&outread, &outwrite, &sa, 0)) return strdup("Cannot create output pipe.");
     SetHandleInformation(outread, HANDLE_FLAG_INHERIT, 0);
 
     if (input) {
-        CreatePipe(&inread, &inwrite, &sa, strlen(input) + 1);
+        if (!CreatePipe(&inread, &inwrite, &sa, strlen(input) + 1)) {
+            CloseHandle(outread); CloseHandle(outwrite);
+            return strdup("Cannot create input pipe.");
+        }
         SetHandleInformation(inwrite, HANDLE_FLAG_INHERIT, 0);
     }
 
@@ -416,13 +439,26 @@ char *tool_handle_run_cmd(const char *cwd, const char *cmd, const char *input) {
     si.hStdError = outwrite;
 
     cmdline = malloc(strlen(cmd) + 16);
+    if (!cmdline) {
+        CloseHandle(outread); CloseHandle(outwrite);
+        if (input) { CloseHandle(inread); CloseHandle(inwrite); }
+        return strdup("Not enough memory for command.");
+    }
     sprintf(cmdline, "cmd.exe /D /C %s", cmd);
 
     started = GetTickCount();
 
     job = CreateJobObjectA(NULL, NULL);
-
-    ok = CreateProcessA(NULL, cmdline, NULL, NULL, TRUE, CREATE_SUSPENDED, NULL, cwd, &si, &pi);
+    limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+    ok = job && SetInformationJobObject(job, JobObjectExtendedLimitInformation, &limits, sizeof(limits));
+    if (ok) {
+        DWORD n = GetSystemDirectoryA(cmdpath, MAX_PATH);
+        ok = n && n < MAX_PATH - 9;
+        if (ok) { strcat(cmdpath, "\\cmd.exe");
+            ok = CreateProcessA(cmdpath, cmdline, NULL, NULL, TRUE,
+                CREATE_SUSPENDED | (agent_pipe != INVALID_HANDLE_VALUE ? CREATE_NO_WINDOW : 0), NULL, cwd, &si, &pi);
+        }
+    }
     free(cmdline);
     CloseHandle(outwrite);
     if (input) CloseHandle(inread);
@@ -432,11 +468,16 @@ char *tool_handle_run_cmd(const char *cwd, const char *cmd, const char *input) {
         if (job) CloseHandle(job);
         CloseHandle(outread);
 
-        sprintf(buf, "CreateProcessA failed: %d\n", GetLastError());
+        sprintf(buf, "CreateProcessA failed: %lu\n", GetLastError());
         return strdup(buf);
     }
 
-    AssignProcessToJobObject(job, pi.hProcess);
+    if (!AssignProcessToJobObject(job, pi.hProcess)) {
+        TerminateProcess(pi.hProcess, 1);
+        CloseHandle(pi.hProcess); CloseHandle(pi.hThread); CloseHandle(job); CloseHandle(outread);
+        if (input) CloseHandle(inwrite);
+        return strdup("Cannot contain command in a job; command was not run.");
+    }
     ResumeThread(pi.hThread);
 
     if (input) {
@@ -445,6 +486,11 @@ char *tool_handle_run_cmd(const char *cwd, const char *cmd, const char *input) {
     }
 
     out = malloc(outsize);
+    if (!out) {
+        TerminateJobObject(job, 8);
+        CloseHandle(job); CloseHandle(pi.hProcess); CloseHandle(pi.hThread); CloseHandle(outread);
+        return strdup("Not enough memory for command output.");
+    }
     for (;;) {
         DRAIN_OUTPUT(outread, out, outsize, outlen);
 
@@ -488,7 +534,7 @@ char *tool_handle_run_cmd(const char *cwd, const char *cmd, const char *input) {
 
         CreateDirectoryA("C:\\Temp", NULL);
         CreateDirectoryA("C:\\Temp\\vc6ai", NULL);
-        sprintf(path, "C:\\Temp\\vc6ai\\call_%u_%d.txt", GetCurrentProcessId(), ++seq);
+        sprintf(path, "C:\\Temp\\vc6ai\\call_%lu_%d.txt", GetCurrentProcessId(), ++seq);
 
         f = fopen(path, "wb");
         if (f) { fwrite(out, 1, outlen, f); fclose(f); }
@@ -510,13 +556,20 @@ char *tool_handle_run_cmd(const char *cwd, const char *cmd, const char *input) {
 char *tool_dispatch(struct config_t *config, const char *name, const char *args_json) {
     const char *cmd, *input = NULL;
     char *out;
-    cJSON *stdin_json, *args = cJSON_Parse(args_json);
+    cJSON *command_json, *stdin_json, *args = cJSON_Parse(args_json);
+    if (!name || strcmp(name, "cmd")) { cJSON_Delete(args); return strdup("Unknown tool."); }
+    command_json = cJSON_GetObjectItemCaseSensitive(args, "command");
+    if (!cJSON_IsObject(args) || !cJSON_IsString(command_json) || !command_json->valuestring[0] ||
+        strlen(command_json->valuestring) > 4000) {
+        cJSON_Delete(args); return strdup("Invalid cmd arguments: command must be a string of 1 to 4000 bytes.");
+    }
 
     term_color(C_FG_DARK_CYAN);
     printf("  $ %s (", name);
 
     if (!strcmp(name, "cmd")) {
         cmd = cJSON_GetObjectItemCaseSensitive(args, "command")->valuestring;
+        agent_emit("tool", cmd);
 
         stdin_json = cJSON_GetObjectItemCaseSensitive(args, "stdin");
         if (cJSON_IsString(stdin_json)) input = stdin_json->valuestring;
@@ -718,77 +771,75 @@ void convo_compact(struct conversation_t *convo) {
     }
 }
 
+static double optional_number(cJSON *object, const char *key) {
+    cJSON *value = cJSON_GetObjectItemCaseSensitive(object, key);
+    return cJSON_IsNumber(value) ? value->valuedouble : 0;
+}
+
 int convo_add_response(struct conversation_t *convo, const char *json) {
-    cJSON *res, *choice, *msg, *err, *usage, *details;
-    cJSON *role, *content, *tc, *tcs;
-    const char *finish_reason;
-    int has_tools = 0;
-    
-    res = cJSON_Parse(json);
-
-#ifdef DEBUG_REQUESTS
-    {
-        char *json = cJSON_Print(res);
-        DBG_REQ("Response: %s\n", json);
-        free(json);
+    cJSON *res, *choice, *msg, *err, *usage, *details, *finish;
+    cJSON *role, *content, *tc, *tcs, *func;
+    const char *error = "Malformed model response.";
+    int has_tools = 0, ti, to;
+    res = json ? cJSON_ParseWithOpts(json, NULL, 1) : NULL;
+    err = cJSON_GetObjectItemCaseSensitive(res, "error");
+    if (err) {
+        content = cJSON_GetObjectItemCaseSensitive(err, "message");
+        if (cJSON_IsString(content)) error = content->valuestring;
+        goto invalid;
     }
-#endif
-
-    err = res ? cJSON_GetObjectItemCaseSensitive(res, "error") : NULL;
-    choice = res ? cJSON_GetArrayItem(cJSON_GetObjectItemCaseSensitive(res, "choices"), 0) : NULL;
-
-    if (err || !choice) {
-        msg = cJSON_GetObjectItemCaseSensitive(err, "message");
-        term_color(C_FG_RED);
-        fprintf(stderr, "  ! api: %s\n\n", msg ? msg->valuestring : "bad response");
-        term_reset();
-        cJSON_Delete(res);
-        return -1;
-    }
-
-    // accumulate session usage stats
-    usage = cJSON_GetObjectItemCaseSensitive(res, "usage");
-    if (usage) {
-        int ti = cJSON_GetObjectItemCaseSensitive(usage, "prompt_tokens")->valueint;
-        int to = cJSON_GetObjectItemCaseSensitive(usage, "completion_tokens")->valueint;
-
-        convo->tokens_in  += ti;
-        convo->tokens_out += to;
-        convo->tokens_ctx = ti + to;
-        convo->cost += cJSON_GetObjectItemCaseSensitive(usage, "cost")->valuedouble;
-        details = cJSON_GetObjectItemCaseSensitive(usage, "prompt_tokens_details");
-        if (details) convo->tokens_cached += cJSON_GetObjectItemCaseSensitive(details, "cached_tokens")->valueint;
-        convo->requests++;
-    }
-
-    finish_reason = cJSON_GetObjectItemCaseSensitive(choice, "finish_reason")->valuestring;
+    choice = cJSON_GetArrayItem(cJSON_GetObjectItemCaseSensitive(res, "choices"), 0);
+    finish = cJSON_GetObjectItemCaseSensitive(choice, "finish_reason");
     msg = cJSON_GetObjectItemCaseSensitive(choice, "message");
     role = cJSON_GetObjectItemCaseSensitive(msg, "role");
-
-    if (!strcmp(finish_reason, "tool_calls")) {
+    content = cJSON_GetObjectItemCaseSensitive(msg, "content");
+    if (!cJSON_IsString(finish) || !finish->valuestring[0] || !cJSON_IsObject(msg) ||
+        !cJSON_IsString(role) || strcmp(role->valuestring, "assistant")) goto invalid;
+    has_tools = !strcmp(finish->valuestring, "tool_calls");
+    if (has_tools) {
+        tcs = cJSON_GetObjectItemCaseSensitive(msg, "tool_calls");
+        if (!cJSON_IsArray(tcs) || !cJSON_GetArraySize(tcs) || cJSON_GetArraySize(tcs) > 16) goto invalid;
+        cJSON_ArrayForEach(tc, tcs) {
+            func = cJSON_GetObjectItemCaseSensitive(tc, "function");
+            role = cJSON_GetObjectItemCaseSensitive(tc, "id");
+            content = cJSON_GetObjectItemCaseSensitive(func, "name");
+            details = cJSON_GetObjectItemCaseSensitive(func, "arguments");
+            if (!cJSON_IsString(role) || !role->valuestring[0] || !cJSON_IsString(content) ||
+                !content->valuestring[0] || !cJSON_IsString(details)) goto invalid;
+        }
         msg = cJSON_Duplicate(msg, cJSON_True);
-
-        // strip response-only fields the API never wants back
+        if (!msg) goto invalid;
         cJSON_DeleteItemFromObject(msg, "refusal");
         cJSON_DeleteItemFromObject(msg, "annotations");
         tcs = cJSON_GetObjectItemCaseSensitive(msg, "tool_calls");
         cJSON_ArrayForEach(tc, tcs) cJSON_DeleteItemFromObject(tc, "index");
-
         cJSON_AddItemToArray(convo->messages, msg);
-
         convo->pending_tool_msg = msg;
-        has_tools = 1;
     } else {
-        content = cJSON_GetObjectItemCaseSensitive(msg, "content");
-        // fine to not duplicate these strings as convo_add_text_message copies
-        convo_add_text_message(convo, role->valuestring, content->valuestring);
+        if (!cJSON_IsString(content)) goto invalid;
+        convo_add_text_message(convo, "assistant", content->valuestring);
     }
-
+    usage = cJSON_GetObjectItemCaseSensitive(res, "usage");
+    ti = (int)optional_number(usage, "prompt_tokens");
+    to = (int)optional_number(usage, "completion_tokens");
+    convo->tokens_in += ti; convo->tokens_out += to; convo->tokens_ctx = ti + to;
+    convo->cost += optional_number(usage, "cost");
+    details = cJSON_GetObjectItemCaseSensitive(usage, "prompt_tokens_details");
+    convo->tokens_cached += (int)optional_number(details, "cached_tokens");
+    ++convo->requests;
+#ifdef DEBUG_REQUESTS
+    DBG_REQ("Response: %s\n", json);
+#endif
     cJSON_Delete(res);
-
     return has_tools;
+invalid:
+    term_color(C_FG_RED);
+    fprintf(stderr, "  ! api: %s\n\n", error);
+    agent_emit("error", error);
+    term_reset();
+    cJSON_Delete(res);
+    return -1;
 }
-
 void convo_handle_tool_calls(struct conversation_t *convo, struct config_t *config) {
     cJSON *tcs, *tc, *func;
     const char *id, *name, *args_json;
@@ -830,8 +881,8 @@ void openrouter_init(struct http_context_t *ctx, const char *api_key) {
     _snprintf(buf, sizeof(buf), "Authorization: Bearer %s", api_key);
     ctx->headers = curl_slist_append(ctx->headers, buf);
     ctx->headers = curl_slist_append(ctx->headers, "Content-Type: application/json");
-    ctx->headers = curl_slist_append(ctx->headers, "HTTP-Referer: https://csxn.gr");
-    ctx->headers = curl_slist_append(ctx->headers, "X-Title: VC6ai");
+    ctx->headers = curl_slist_append(ctx->headers, "HTTP-Referer: https://github.com/LeoSasion/XP-Harness-Desktop");
+    ctx->headers = curl_slist_append(ctx->headers, "X-Title: XP-Harness-Desktop");
 
     curl_easy_setopt(ctx->curl, CURLOPT_HTTPHEADER, ctx->headers);
 }
@@ -886,6 +937,7 @@ CURLcode openrouter_request(struct http_context_t *ctx, struct conversation_t *c
 
     if (res != CURLE_OK && res != CURLE_ABORTED_BY_CALLBACK) {
         fprintf(stderr, "curl_easy_perform() failed: %s\n", curl_easy_strerror(res));
+        agent_emit("error", curl_easy_strerror(res));
     }
 
     return res;
@@ -918,37 +970,58 @@ char *trim(char *str) {
 #define SYSPROMPT_MAX 32768
 
 const char *sysprompt =
-    "You are VC6ai, an AI agent that gets things done on this machine. "
-    "Use British English and plain ASCII in replies. "
+    "You are XP-Harness-Desktop, an AI agent that gets things done on this machine. "
+    "Reply in the user's language. "
     "Be concise and practical, using short paragraphs and lists only when useful. "
     "Suggest only Windows XP-compatible commands and methods. "
     "Run independent tool calls in parallel and batch related commands into one call. "
     "Do not re-read files or re-run commands whose output you already have unless something changed.";
 
+static int prompt_append(char *buf, int pos, const char *fmt, ...) {
+    int written, available = SYSPROMPT_MAX - pos;
+    va_list args;
+    if (available <= 1) return pos;
+    va_start(args, fmt);
+    written = _vsnprintf(buf + pos, available, fmt, args);
+    va_end(args);
+    if (written < 0 || written >= available) written = available - 1;
+    buf[pos + written] = 0;
+    return pos + written;
+}
+
+static const char *path_utf8(const char *path, char *utf8) {
+    WCHAR wide[MAX_PATH];
+    utf8[0] = 0;
+    if (MultiByteToWideChar(CP_ACP, 0, path, -1, wide, MAX_PATH))
+        WideCharToMultiByte(CP_UTF8, 0, wide, -1, utf8, MAX_PATH * 3, NULL, NULL);
+    return utf8;
+}
+
 void convo_add_sysprompt(struct conversation_t *convo, struct config_t *config) {
     char buf[SYSPROMPT_MAX];
+    char utf8[MAX_PATH * 3];
     struct _finddata_t fd;
     long h;
     int n;
     FILE *f;
 
     // add base sysprompt + cwd
-    n = _snprintf(buf, SYSPROMPT_MAX, "%s\nCurrent directory: %s\nCurrent directory contents:", sysprompt, config->cwd);
+    n = prompt_append(buf, 0, "%s\nCurrent directory: %s\nCurrent directory contents:", sysprompt, path_utf8(config->cwd, utf8));
     
     // add cwd content
     h = _findfirst("*", &fd);
-    do {
+    if (h != -1) { do {
         if (fd.name[0] == '.') continue;
-        n += _snprintf(buf + n, SYSPROMPT_MAX - n, " %s%s", fd.name, (fd.attrib & _A_SUBDIR) ? "/" : "");
+        n = prompt_append(buf, n, " %s%s", path_utf8(fd.name, utf8), (fd.attrib & _A_SUBDIR) ? "/" : "");
     } while (_findnext(h, &fd) == 0);
-    _findclose(h);
+    _findclose(h); }
 
     // add AGENTS.md contents if exists
     f = fopen("AGENTS.md", "rb");
     if (f) {
-        n += _snprintf(buf + n, SYSPROMPT_MAX - n, "\n\nInstructions from AGENTS.md:\n---\n");
-        n += fread(buf + n, 1, SYSPROMPT_MAX - n - 8, f);
-        n += _snprintf(buf + n, SYSPROMPT_MAX - n, "\n---");
+        n = prompt_append(buf, n, "\n\nInstructions from AGENTS.md:\n---\n");
+        if (n < SYSPROMPT_MAX - 8) n += fread(buf + n, 1, SYSPROMPT_MAX - n - 8, f);
+        n = prompt_append(buf, n, "\n---");
         fclose(f);
     }
     buf[n] = '\0';
@@ -956,19 +1029,22 @@ void convo_add_sysprompt(struct conversation_t *convo, struct config_t *config) 
     convo_add_text_message(convo, "system", buf);
 }
 
+#include "agent_mode.inc"
+
 int main(int argc, char **argv) {
     char buf[4096], *prompt, *out;
     struct config_t config = {0};
     struct http_context_t http = {0};
     struct conversation_t convo = {0};
     
+    if (argc > 1 && !strcmp(argv[1], "--pipe")) return agent_main(argc, argv);
     term_init();
     config_init(&config, ini_file);
 
     // fancy title with background grad
     printf("\n ");
-    term_color(C_FG_WHITE | C_BG_DARK_BLUE);   printf(" VC6");
-    term_color(C_FG_WHITE | C_BG_DARK_PURPLE); printf("ai");
+    term_color(C_FG_WHITE | C_BG_DARK_BLUE);   printf(" XP-Harness-");
+    term_color(C_FG_WHITE | C_BG_DARK_PURPLE); printf("Desktop");
     term_color(C_FG_WHITE | C_BG_DARK_RED);    printf(" ");
     term_reset();
     printf("\n\n");
@@ -1011,7 +1087,7 @@ prompt:
                 goto cleanup;
             } else if (!strncmp(&prompt[1], "new", 3)) {
                 term_reset();
-                printf("  ¯ conversation cleared\n\n");
+                printf("  \257 conversation cleared\n\n");
                 convo_clear(&convo);
                 goto prompt;
             } else if (!strncmp(&prompt[1], "model", 5)) {
@@ -1024,7 +1100,7 @@ prompt:
                     openrouter_fetch_limits(&http, &config);
                 }
                 term_reset();
-                printf("  ¯ current model: %s\n", config.model);
+                printf("  \257 current model: %s\n", config.model);
                 printf("    reasoning: %s\n", config.effort);
                 if (config.context > 0) printf("    context window: %d\n", config.context);
                 printf("    data collection: %s\n", config.datacoll ? "allowed" : "denied");
@@ -1032,7 +1108,7 @@ prompt:
                 goto prompt;
             } else if (!strncmp(&prompt[1], "stats", 5)) {
                 term_reset();
-                printf("  ¯ session stats (%d requests)\n", convo.requests);
+                printf("  \257 session stats (%d requests)\n", convo.requests);
                 printf("    tokens in:  %d\n", convo.tokens_in);
                 printf("    tokens out: %d\n", convo.tokens_out);
                 printf("    cached in:  %d\n", convo.tokens_cached);
@@ -1048,7 +1124,7 @@ prompt:
             }
 
             term_color(C_FG_RED);
-            fprintf(stderr, "  ¯ unrecognised slash command: %s\n\n", prompt);
+            fprintf(stderr, "  \257 unrecognised slash command: %s\n\n", prompt);
             goto prompt;
         } else if (prompt[0] == '!') {
             // execute cmd directly

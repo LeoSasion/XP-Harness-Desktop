@@ -12,6 +12,8 @@ import subprocess
 import sys
 import tempfile
 import time
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
 
 k = C.WinDLL('kernel32', use_last_error=True)
 k.CreateFileW.argtypes = [W.LPCWSTR, W.DWORD, W.DWORD, W.LPVOID, W.DWORD, W.DWORD, W.HANDLE]
@@ -95,13 +97,77 @@ class Core:
             self.process.wait()
 
 
+def check_custom_api(directory):
+    requests = []
+
+    class Mock(BaseHTTPRequestHandler):
+        def log_message(self, *args):
+            pass
+
+        def do_POST(self):
+            body = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
+            requests.append((self.path, self.headers.get('Authorization'), body))
+            n = len(requests)
+            message = {'role': 'assistant', 'content': 'mock reply'}
+            finish = 'stop'
+            if n in (1, 2):
+                finish = 'tool_calls'
+                message.update(content=None, tool_calls=[{
+                    'id': f'call_{n}', 'type': 'function', 'function': {
+                        'name': 'cmd', 'arguments': json.dumps({'command': f'echo mock-{n}'})}}])
+            data = json.dumps({'choices': [{'finish_reason': finish, 'message': message}]}).encode()
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json')
+            self.send_header('Content-Length', str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+    server = HTTPServer(('127.0.0.1', 0), Mock)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        for key in ('mock-key', ''):
+            requests.clear()
+            (directory / 'vc6ai.ini').write_text(
+                f'[LLM]\nApiUrl=http://127.0.0.1:{server.server_port}/custom/chat/completions?test=1\n'
+                f'ApiKey={key}\nModel=mock-model\n', encoding='ascii')
+            core = Core(directory)
+            try:
+                assert not requests, 'Startup must not fetch provider metadata'
+                events = core.turn({'type': 'chat', 'text': 'test tools'})
+                assert [e['text'] for e in events if e['type'] == 'assistant'] == ['mock reply'], events
+                assert len([e for e in events if e['type'] == 'tool']) == 2, events
+                events = core.turn({'type': 'chat', 'text': 'follow up'})
+                assert any(e['type'] == 'assistant' for e in events), events
+                assert len(requests) == 4, requests
+                for path, auth, body in requests:
+                    assert path == '/custom/chat/completions?test=1', path
+                    assert auth == ('Bearer mock-key' if key else None), auth
+                    assert body['model'] == 'mock-model', body
+                    assert set(body) == {'model', 'messages', 'tools'}, body.keys()
+                messages = requests[2][2]['messages']
+                outputs = [m for m in messages if m['role'] == 'tool']
+                assert [m['tool_call_id'] for m in outputs] == ['call_1', 'call_2'], outputs
+                assert all(f'mock-{i}' in m['content'] and '[exit 0]' in m['content']
+                           for i, m in enumerate(outputs, 1)), outputs
+                assert requests[3][2]['messages'][-2:] == [
+                    {'role': 'assistant', 'content': 'mock reply'},
+                    {'role': 'user', 'content': 'follow up'}]
+            finally:
+                core.close()
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=3)
+
+
 def main():
     source = Path(sys.argv[1]).resolve()
     with tempfile.TemporaryDirectory(prefix='vc6ai-smoke-') as tmp:
         directory = Path(tmp)
         for name in ('AgentCore.exe', 'libcurl-4.dll', 'curl-ca-bundle.crt'):
             shutil.copy2(source.parent / name, directory / name)
-        (directory / 'vc6ai.ini').write_text('[OpenRouter]\nApiKey=\nModel=offline-test\n', encoding='ascii')
+        (directory / 'vc6ai.ini').write_text('[LLM]\nApiUrl=\nModel=offline-test\n', encoding='ascii')
         core = Core(directory)
         try:
             # Startup is deliberately local: no API credentials or network needed.
@@ -135,7 +201,8 @@ def main():
             core.process.wait(timeout=3)
         finally:
             core.close()
-    print('smoke: fragmented IPC, Unicode, reset, missing key, unknown type, shutdown, malformed and oversized frames passed')
+        check_custom_api(directory)
+    print('smoke: IPC checks, custom HTTP endpoint, optional authentication, two tool rounds and conversation history passed')
 
 
 if __name__ == '__main__':

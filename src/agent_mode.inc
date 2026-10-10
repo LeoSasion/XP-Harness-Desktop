@@ -60,7 +60,7 @@ static int agent_main(int argc, char **argv) {
         } else if (!cJSON_IsString(text) || !text->valuestring[0] || strlen(text->valuestring) > 65536) {
             agent_emit("error", "Chat text must contain 1 to 65536 UTF-8 bytes.");
         } else if (!llm_configured(&config)) {
-            agent_emit("error", "Set [LLM] ApiUrl (full http/https endpoint) and Model. Edit vc6ai.ini, then click Stop before sending again.");
+            agent_emit("error", "Check [LLM] ApiUrl, Model and optional ExtraBody JSON. Edit vc6ai.ini, then click Stop before sending again.");
         } else {
             before = cJSON_GetArraySize(convo.messages);
             success = 0;

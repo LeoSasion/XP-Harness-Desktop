@@ -67,10 +67,12 @@ struct config_t {
     char api_key[APIKEY_MAX];
     char model[MODEL_MAX];
     char api_url[APIURL_MAX];
+    char extra_body[2048]; /* optional provider parameters; never override core fields */
 
     // Exa config
     char exa_key[APIKEY_MAX];
 
+    int stream; // CLI streaming only
     int context; // model's context window
 };
 
@@ -85,8 +87,10 @@ void config_init(struct config_t *config, const char *ini_file) {
     GetPrivateProfileStringA("LLM", "ApiUrl", "", config->api_url, APIURL_MAX, ini_path);
     GetPrivateProfileStringA("LLM", "ApiKey", "", config->api_key, APIKEY_MAX, ini_path);
     GetPrivateProfileStringA("LLM", "Model", "", config->model, MODEL_MAX, ini_path);
+    GetPrivateProfileStringA("LLM", "ExtraBody", "", config->extra_body, sizeof(config->extra_body), ini_path);
     GetPrivateProfileStringA("Exa", "ApiKey", "", config->exa_key, APIKEY_MAX, ini_path);
     if (config->exa_key[0]) SetEnvironmentVariableA("EXA_API_KEY", config->exa_key);
+    config->stream = GetPrivateProfileIntA("LLM", "Stream", 1, ini_path);
     config->context = GetPrivateProfileIntA("LLM", "ContextWindow", 0, ini_path);
 }
 
@@ -114,17 +118,6 @@ enum term_color {
     C_BG_DARK_PURPLE = BACKGROUND_RED | BACKGROUND_BLUE
 };
 
-enum term_md_state {
-    MD_NORMAL,
-    MD_BOLD,
-    MD_ITALIC,
-    MD_CODE_SPAN,
-    MD_LINK_TEXT,
-    MD_LINK_URL,
-    MD_BLOCKQUOTE,
-    MD_CODE_BLOCK
-};
-
 static HANDLE term_handle;
 static WORD term_orig_attrs;
 
@@ -139,7 +132,7 @@ static BOOL WINAPI term_ctrl_handler(DWORD type) {
 }
 
 void term_init(void) {
-    CONSOLE_SCREEN_BUFFER_INFO csbi;
+    CONSOLE_SCREEN_BUFFER_INFO csbi = {0};
     term_handle = GetStdHandle(STD_OUTPUT_HANDLE);
     GetConsoleScreenBufferInfo(term_handle, &csbi);
     term_orig_attrs = csbi.wAttributes;
@@ -164,84 +157,29 @@ void term_reset(void) {
     SetConsoleTextAttribute(term_handle, term_orig_attrs);
 }
 
-void term_render_markdown(const char *str) {
-    size_t i, len = strlen(str);
-    enum term_md_state state = MD_NORMAL;
-    char c;
-#define BOL (i == 0 || str[i-1] == '\n')
-#define TBK (i + 2 < len && str[i+1] == '`' && str[i+2] == '`')
+/* Write complete UTF-8 fragments through the XP Unicode console API. */
+static void term_write_utf8(const char *text) {
+    DWORD mode, written;
+    int length;
+    WCHAR *wide;
+    fflush(stdout);
+    if (!GetConsoleMode(GetStdHandle(STD_OUTPUT_HANDLE), &mode)) { fputs(text, stdout); return; }
+    length = MultiByteToWideChar(CP_UTF8, 0, text, -1, NULL, 0);
+    wide = malloc(length * sizeof(WCHAR));
+    if (!wide) return;
+    MultiByteToWideChar(CP_UTF8, 0, text, -1, wide, length);
+    WriteConsoleW(GetStdHandle(STD_OUTPUT_HANDLE), wide, length - 1, &written, NULL);
+    free(wide);
+}
 
-    term_reset();
-    for (i = 0; i < len; ++i) {
-        c = str[i];
-
-        // passthrough states
-        if (state == MD_CODE_BLOCK) {
-            if (c == '`' && BOL && TBK) { state = MD_NORMAL; term_reset(); i += 2; continue; }
-            putchar(c); continue;
-        }
-        if (state == MD_CODE_SPAN) { if (c == '`') { state = MD_NORMAL; term_reset(); } else putchar(c); continue; }
-        if (state == MD_LINK_URL) { putchar(c); if (c == ')') { state = MD_NORMAL; term_reset(); } continue; }
-        if (state == MD_BLOCKQUOTE) { if (c == '\n') { state = MD_NORMAL; term_reset(); } putchar(c); continue; }
-        if (state == MD_LINK_TEXT) {
-            if (c == ']' && i + 1 < len && str[i+1] == '(') {
-                putchar(c); state = MD_LINK_URL; i++; term_color(C_FG_DARK_GRAY); putchar('(');
-            } else putchar(c);
-            continue;
-        }
-
-        // heading
-        if (c == '#' && BOL) {
-            int level = 1;
-            while (i + 1 < len && str[i+1] == '#') { level++; i++; }
-            while (i + 1 < len && str[i+1] == ' ') i++;
-            term_color(C_FG_WHITE | (level == 1 ? C_BG_DARK_RED : level == 2 ? C_BG_DARK_PURPLE : C_BG_DARK_BLUE));
-            putchar(' ');
-            continue;
-
-        }
-
-        // code block / span
-        if (c == '`' && BOL && TBK) { state = MD_CODE_BLOCK; term_color(C_FG_YELLOW); i += 2; while (i + 1 < len && str[i+1] != '\n') i++; continue; }
-        if (c == '`') { state = MD_CODE_SPAN; term_color(C_FG_YELLOW); continue; }
-        
-        // bold or italic, * or _, doubled or tripled for bold
-        if (c == '*' || c == '_') {
-            int n = 1;
-            while (i + n < len && str[i+n] == c && n < 3) n++;
-            if (c == '_' && i > 0 && isalnum(str[i-1]) && i + n < len && isalnum(str[i+n])) { putchar(c); continue; } // skip if snake_case_name
-            if (n >= 2) {
-                if (state == MD_BOLD) { state = MD_NORMAL; term_reset(); } else { state = MD_BOLD; term_color(C_FG_WHITE); }
-            } else {
-                if (state == MD_ITALIC) { state = MD_NORMAL; term_reset(); } else { state = MD_ITALIC; term_color(C_FG_DARK_YELLOW); }
-            }
-            i += n - 1; continue;
-        }
-
-        // list: - at line start
-        if (c == '-' && i + 1 < len && str[i+1] == ' ' && BOL) { putchar(249); putchar(' '); i++; continue; } // replace - with bullet
-
-        // blockquote: > at line start, followed by space or end of line. grey until newline resets
-        if (c == '>' && BOL && (i + 1 >= len || str[i+1] == ' ' || str[i+1] == '\n')) {
-            state = MD_BLOCKQUOTE; term_color(C_FG_DARK_GRAY); putchar('>');
-            continue;
-        }
-
-        // link: only treat [ as a link when ]( follows on the same line
-        if (c == '[') {
-            size_t j = i + 1;
-            while (j < len && str[j] != '\n' && str[j] != ']') j++;
-            if (j + 1 < len && str[j] == ']' && str[j+1] == '(') {
-                state = MD_LINK_TEXT; term_color(C_FG_BLUE); putchar(c); continue;
-            }
-        }
-
-        if (c == '\n') term_reset();
-        putchar(c);
-    }
-#undef BOL
-#undef TBK
-    term_reset();
+static char *term_read_utf8(char *buffer, int size) {
+    WCHAR wide[4096];
+    DWORD mode, count;
+    if (!GetConsoleMode(GetStdHandle(STD_INPUT_HANDLE), &mode)) return fgets(buffer, size, stdin);
+    if (!ReadConsoleW(GetStdHandle(STD_INPUT_HANDLE), wide, 4095, &count, NULL) || !count) return NULL;
+    wide[count] = 0;
+    if (!WideCharToMultiByte(CP_UTF8, 0, wide, -1, buffer, size, NULL, NULL)) buffer[0] = 0;
+    return buffer;
 }
 
 //////////////////////////////////////////////////////////////////////////
@@ -253,6 +191,7 @@ struct http_context_t {
     struct curl_slist *headers;
     char *res;
     size_t reslen;
+    int stream, streamed;
 };
 
 static size_t http_write_callback(char *data, size_t size, size_t nmemb, void *userdata) {
@@ -560,7 +499,8 @@ char *tool_dispatch(struct config_t *config, const char *name, const char *args_
     }
 
     term_color(C_FG_DARK_CYAN);
-    printf("  $ %s (", name);
+    if (agent_pipe == INVALID_HANDLE_VALUE) printf("\n[Tool: %s]\n", name);
+    else printf("  $ %s (", name);
 
     if (!strcmp(name, "cmd")) {
         cmd = cJSON_GetObjectItemCaseSensitive(args, "command")->valuestring;
@@ -573,12 +513,17 @@ char *tool_dispatch(struct config_t *config, const char *name, const char *args_
         DBG_TOOL("Tool call (%s): %s\n", name, cmd);
 #endif
 
-        if (strlen(cmd) > 62) printf("%.62s...", cmd);
+        if (agent_pipe == INVALID_HANDLE_VALUE) {
+            term_write_utf8(cmd); printf("\n");
+            if (input) { printf("[stdin]\n"); term_write_utf8(input); printf("\n"); }
+        }
+        else if (strlen(cmd) > 62) printf("%.62s...", cmd);
         else fputs(cmd, stdout);
+        fflush(stdout);
         out = tool_handle_run_cmd(config->cwd, cmd, input);
     }
 
-    printf(")\n");
+    if (agent_pipe != INVALID_HANDLE_VALUE) printf(")\n");
     term_reset();
 
     cJSON_Delete(args);
@@ -608,7 +553,7 @@ struct conversation_t {
 void convo_init(struct conversation_t *convo, struct config_t *config, const struct tool_t *tooldefs) {
     const struct tool_t *tooldef;
     const struct tool_params_t *paramdef;
-    cJSON *messages;
+    cJSON *messages, *options, *option;
     cJSON *tools, *tool, *func, *params, *props, *prop, *reqs;
     cJSON *root = cJSON_CreateObject();
     int i, j;
@@ -657,6 +602,12 @@ void convo_init(struct conversation_t *convo, struct config_t *config, const str
 
     messages = cJSON_CreateArray();
     cJSON_AddItemToObject(root, "messages", messages);
+    options = cJSON_Parse(config->extra_body);
+    if (cJSON_IsObject(options)) cJSON_ArrayForEach(option, options) {
+        if (strcmp(option->string, "stream") && !cJSON_GetObjectItemCaseSensitive(root, option->string))
+            cJSON_AddItemToObject(root, option->string, cJSON_Duplicate(option, 1));
+    }
+    cJSON_Delete(options);
 
     memset(convo, 0, sizeof(struct conversation_t));
     convo->root = root;
@@ -779,7 +730,12 @@ int convo_add_response(struct conversation_t *convo, const char *json) {
         convo->pending_tool_msg = msg;
     } else {
         if (!cJSON_IsString(content)) goto invalid;
-        convo_add_text_message(convo, "assistant", content->valuestring);
+        msg = cJSON_Duplicate(msg, cJSON_True);
+        if (!msg) goto invalid;
+        cJSON_DeleteItemFromObject(msg, "refusal");
+        cJSON_DeleteItemFromObject(msg, "annotations");
+        cJSON_AddItemToArray(convo->messages, msg);
+        convo->content = cJSON_GetObjectItemCaseSensitive(msg, "content")->valuestring;
     }
     usage = cJSON_GetObjectItemCaseSensitive(res, "usage");
     ti = (int)optional_number(usage, "prompt_tokens");
@@ -818,6 +774,9 @@ void convo_handle_tool_calls(struct conversation_t *convo, struct config_t *conf
         args_json = cJSON_GetObjectItemCaseSensitive(func, "arguments")->valuestring;
  
         content = tool_dispatch(config, name, args_json);
+        if (agent_pipe == INVALID_HANDLE_VALUE && content) {
+            printf("[Tool result: %s]\n", id); term_write_utf8(content); printf("\n"); fflush(stdout);
+        }
         convo_add_tool_message(convo, id, content);
         free(content);
     }
@@ -849,17 +808,31 @@ void llm_init(struct http_context_t *ctx, const struct config_t *config) {
     curl_easy_setopt(ctx->curl, CURLOPT_PROTOCOLS, CURLPROTO_HTTP | CURLPROTO_HTTPS);
     curl_easy_setopt(ctx->curl, CURLOPT_FOLLOWLOCATION, 0L);
 
+    ctx->stream = config->stream && agent_pipe == INVALID_HANDLE_VALUE;
     curl_easy_setopt(ctx->curl, CURLOPT_HTTPHEADER, ctx->headers);
 }
 
 static int llm_configured(const struct config_t *config) {
+    cJSON *options;
+    int valid;
+    if (config->extra_body[0]) {
+        options = cJSON_ParseWithOpts(config->extra_body, NULL, 1);
+        valid = cJSON_IsObject(options); cJSON_Delete(options);
+        if (!valid) return 0;
+    }
     return config->model[0] &&
         (!strncmp(config->api_url, "https://", 8) || !strncmp(config->api_url, "http://", 7));
 }
 
+#include "stream.inc"
+
 CURLcode llm_request(struct http_context_t *ctx, struct conversation_t *convo) {
     CURLcode res;
-    char *payload = cJSON_PrintUnformatted(convo->root);
+    char *payload;
+    ctx->streamed = 0;
+    if (ctx->stream) return stream_request(ctx, convo);
+    payload = cJSON_PrintUnformatted(convo->root);
+    if (!payload) return CURLE_OUT_OF_MEMORY;
 
 #ifdef DEBUG_REQUESTS
     {
@@ -973,7 +946,8 @@ void convo_add_sysprompt(struct conversation_t *convo, struct config_t *config) 
 #include "agent_mode.inc"
 
 int main(int argc, char **argv) {
-    char buf[4096], *prompt, *out;
+    char buf[16384], *prompt, *out;
+    int before = 0, round = 0;
     struct config_t config = {0};
     struct http_context_t http = {0};
     struct conversation_t convo = {0};
@@ -982,7 +956,7 @@ int main(int argc, char **argv) {
     term_init();
     config_init(&config, ini_file);
     if (!llm_configured(&config)) {
-        fprintf(stderr, "Set [LLM] ApiUrl (full http/https endpoint) and Model in vc6ai.ini.\n");
+        fprintf(stderr, "Check [LLM] ApiUrl, Model and optional ExtraBody JSON in vc6ai.ini.\n");
         return 1;
     }
 
@@ -1002,7 +976,7 @@ int main(int argc, char **argv) {
     convo_init(&convo, &config, tools);
     convo_add_sysprompt(&convo, &config);
 
-    http_init(&http, 600L); // 10 minute timeout to allow for longer thinking sessions
+    if (http_init(&http, 600L)) return 1; // allow longer thinking sessions
     llm_init(&http, &config);
 
     for (;;) {
@@ -1010,7 +984,8 @@ prompt:
         term_reset();
         printf("> ");
         term_color(C_FG_TURQUOISE);
-        if (!fgets(buf, sizeof(buf), stdin)) {
+        fflush(stdout);
+        if (!term_read_utf8(buf, sizeof(buf))) {
             // handle Ctrl-C abort
             if (term_interrupted()) {
                 term_interrupt_reset();
@@ -1084,6 +1059,7 @@ prompt:
         convo_compact(&convo);
 
         // store user message
+        before = cJSON_GetArraySize(convo.messages); round = 0;
         convo_add_text_message(&convo, "user", prompt);
 
         term_color(C_FG_DARK_CYAN);
@@ -1091,13 +1067,18 @@ prompt:
         term_reset();
 
 request:
+        if (++round > 24) {
+            fprintf(stderr, "Stopped after 24 model requests in this turn.\n");
+            goto turn_failed;
+        }
+        printf("[Request %d]\n", round); fflush(stdout);
         // send user message to LLM
         if (llm_request(&http, &convo)) {
             if (term_interrupted()) {
                 term_interrupt_reset();
                 printf("  ~ interrupted\n\n");
             }
-            goto prompt;
+            goto turn_failed;
         }
 
         // parse LLM (assistant) response
@@ -1105,7 +1086,7 @@ request:
         //    0: ok
         //    1: ok + has tool calls 
         switch (convo_add_response(&convo, http.res)) {
-            case -1: goto prompt;
+            case -1: goto turn_failed;
             case 1:
                 convo_handle_tool_calls(&convo, &config);
                 // send tool call result to LLM
@@ -1114,8 +1095,13 @@ request:
 
         // print LLM response
         putchar('\n');
-        term_render_markdown(convo.content);
+        if (!http.streamed) term_write_utf8(convo.content);
         printf("\n\n");
+        continue;
+turn_failed:
+        while (cJSON_GetArraySize(convo.messages) > before)
+            cJSON_DeleteItemFromArray(convo.messages, before);
+        convo.pending_tool_msg = NULL; convo.content = NULL;
     }
 
 cleanup:

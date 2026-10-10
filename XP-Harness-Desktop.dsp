@@ -113,6 +113,10 @@ SOURCE=.\src\ipc.h
 
 SOURCE=.\src\agent_mode.inc
 # End Source File
+# Begin Source File
+
+SOURCE=.\src\stream.inc
+# End Source File
 # End Group
 # Begin Group "Resource Files"
 

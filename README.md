@@ -45,12 +45,29 @@ Model=your-model
 
 `ApiUrl` 必须是完整的 HTTP/HTTPS Chat Completions 端点；程序不拼接路径，不内置服务商地址。`ApiKey` 使用 Bearer 认证，不需要认证的本地服务可以留空。模型需支持 `messages`、`tools` 和 `tool_calls`；不直接支持其他协议（例如 Anthropic Messages 或 Responses）。不自动跟随重定向，请填写最终端点。
 
-旧版 `[OpenRouter]` 配置需要改为 `[LLM]` 并填写地址；不再发送 Provider、Effort、DataCollection、ZeroDataRetention 或缓存扩展参数，模型的思考模式使用服务端默认值。可选 `ContextWindow` 仅供 CLI 显示上下文统计。保存后点击 **Stop**，再发送消息以重新载入配置。不要提交含密钥的 INI 文件。
+旧版 `[OpenRouter]` 配置需要改为 `[LLM]` 并填写地址；不再默认发送 Provider、Effort、DataCollection、ZeroDataRetention 或缓存扩展参数。可选 `ExtraBody` 为一行 JSON 对象，用于服务商的思考开关等参数；不能覆盖 `model`、`messages`、`tools`、`stream`。可选 `ContextWindow` 仅供 CLI 显示上下文统计。保存后点击 **Stop**，再发送消息以重新载入配置；命令行则退出后重启。不要提交含密钥的 INI 文件。
+
+### 命令行与 DeepSeek
+
+双击根目录 `console.bat`，或进入构建产物目录运行 `AgentCore.exe`。`Stream=1`（默认）启用命令行流式输出，依次显示 `[Request]`、`[Thinking]`、`[Answer]`、`[Tool]` 和 `[Tool result]`，包含完整命令、结果和退出码。Ctrl+C 中断当前请求，`/new` 清空会话，`/exit` 退出。`Stream=0` 使用完整 JSON 响应。流式时按原始文本输出 Markdown；没有额外终端库。
+
+DeepSeek 官方配置示例（密钥自行填写）：
+
+```ini
+[LLM]
+ApiUrl=https://api.deepseek.com/chat/completions
+ApiKey=
+Model=deepseek-flash
+Stream=1
+ExtraBody={"thinking":{"type":"enabled"},"reasoning_effort":"high"}
+```
+
+模型名和参数依据 [DeepSeek 官方入门文档](https://api-docs.deepseek.com/) 与 [思考模式文档](https://api-docs.deepseek.com/guides/thinking_mode/)。仅展示 API 实际公开返回的思考文本；简单请求可能没有思考片段。`reasoning_content` 随 assistant 历史保留并回传，以支持 DeepSeek 思考模式下的多轮工具调用。
 
 ### 当前 Agent 能力
 
-- 多轮对话与多轮工具调用：支持。每次桌面提问最多 24 次模型请求，每个响应最多 16 个工具调用；当前仅有 `cmd` 工具，按顺序执行，结果回传模型。
-- 深度思考展示：未实现。目前是非流式请求，仅显示状态、工具命令和最终回答；不展示单独的 reasoning 字段。可展示的思考内容取决于服务端是否公开返回，客户端无法获取模型未提供的内部推理。
+- 多轮对话与多轮工具调用：支持。每次提问最多 24 次模型请求，每个响应最多 16 个工具调用；当前仅有 `cmd` 工具，按顺序执行，结果回传模型。
+- 深度思考展示：命令行支持流式 `reasoning_content`（也接受文本 `reasoning`），回答和工具参数的碎片会正确拼接。缺失完成标记、中断或错误的响应不会执行其中的工具，失败轮次会从历史移除。桌面窗口仍采用完整 JSON 请求，仅显示状态、工具命令和最终回答。
 - MCP：未实现，没有 MCP 协议客户端、服务器配置或工具发现。
 
 上游附带的 libcurl 使用 OpenSSL；这里保留证书验证与 CA 文件，不改用 Windows 系统 TLS。实际联网能力仍需在目标 XP 机器验证。不要仅凭 `_WIN32_WINNT` 或 PE 子系统版本判断兼容性。
@@ -63,6 +80,7 @@ Model=your-model
 | --- | --- |
 | `src/main.c` | 复用上游模型、工具、会话与 CLI，补充必要校验 |
 | `src/agent_mode.inc` | 桌面模式入口，复用同一份 Agent 实现 |
+| `src/stream.inc` | 命令行 SSE 增量解析、思考/回答输出和工具参数拼接 |
 | `src/desktop.c` | 一个 Win32 窗口与后台通信线程 |
 | `src/ipc.c` / `src/ipc.h` | 长度前缀、256 KiB 上限、可取消 I/O、当前登录会话 ACL |
 | `src/cJSON.*` / `dep/` | 上游依赖 |
@@ -76,8 +94,9 @@ IPC 为 4 字节小端长度加 UTF-8 JSON；单连接、单次请求。请求�
 ```powershell
 & .\tests\build-host.ps1 -Zig 'C:\tools\zig\zig.exe'
 python tests\smoke.py build\host\AgentCore.exe
+python tests\stream_smoke.py build\host\AgentCore.exe
 ```
 
-这些测试不需要真实 API Key、不请求云端模型。原生测试覆盖响应校验与 IPC；smoke 测试运行本地 HTTP 模拟服务，检查自定义地址、可选认证、两轮无害 `echo` 工具调用与后续对话历史。`build\host` 是开发验证产物，不是经过认证的 XP 发布包。
+这些测试不需要真实 API Key、不请求云端模型。原生测试覆盖响应校验与 IPC；smoke 测试运行本地 HTTP 模拟服务，检查自定义地址、可选认证、两轮无害 `echo` 工具调用与后续对话历史。stream_smoke 检查回复完成前的实时输出、碎片化 SSE/UTF-8/工具参数、思考历史回传、流中断/HTTP 错误后的恢复。`build\host` 是开发验证产物，不是经过认证的 XP 发布包。
 
 当前验证结果见 [VALIDATION.md](VALIDATION.md)。

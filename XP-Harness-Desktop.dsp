@@ -117,6 +117,10 @@ SOURCE=.\src\agent_mode.inc
 
 SOURCE=.\src\stream.inc
 # End Source File
+# Begin Source File
+
+SOURCE=.\src\memory.inc
+# End Source File
 # End Group
 # Begin Group "Resource Files"
 

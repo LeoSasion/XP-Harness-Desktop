@@ -21,3 +21,4 @@ stuff/
 build/
 dist/
 __pycache__/
+data/

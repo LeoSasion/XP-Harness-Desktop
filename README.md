@@ -1,6 +1,6 @@
 # XP-Harness-Desktop
 
-VC6AI 的极简 Windows 原生桌面版。基于 [bcsongor/vc6ai](https://github.com/bcsongor/vc6ai)，复用其 C 代码、会话管理、单一 `cmd` 工具、cJSON 和随附的 libcurl；增加桌面窗口与 Named Pipe 通信，模型地址由用户配置。
+VC6AI 的极简 Windows 原生桌面版。左侧管理项目与会话，右侧流式显示思考、回答和工具过程，颜色跟随 Windows。基于 [bcsongor/vc6ai](https://github.com/bcsongor/vc6ai)，复用其 C 代码、单一 `cmd` 工具、cJSON 和随附的 libcurl，模型地址由用户配置。
 
 上游基线：`f99d2f2ec459dff38b5afe89ff0d8a38cf952972`。原 MIT 许可证和第三方 NOTICE 均保留。
 
@@ -15,13 +15,24 @@ Win32 原生控件  ← JSON →  原 VC6AI Agent 循环
 
 ## MVP 范围
 
-- 纯 Win32 聊天窗口、Unicode 输入与回复、工具调用状态。
+- 纯 Win32 项目/会话树、Unicode 输入与回复、嵌入式流式过程输出。
 - 独立 AgentCore，后台请求不会阻塞窗口。
-- 发送、新对话、停止、配置入口；Ctrl+Enter 发送。
+- 创建项目、创建会话、重命名、切换会话、编辑项目记忆；Ctrl+Enter 发送。
+- 会话和项目笔记本地持久化，重启可恢复；Stop 中断当前任务并保留已完成历史。
 - 配置沿用 `vc6ai.ini`，用系统记事本编辑。
-- `AgentCore.exe` 不带参数仍是上游命令行模式。
+- `AgentCore.exe` 不带参数仍可单独使用命令行模式。
 
-对话仅保存在内存。停止会结束本窗口启动的 Core，下次发送创建新会话。Markdown 暂按文本显示。Memory、Skill、DLL 插件、托盘、拖放和 Explorer 集成均不在本次 MVP 内。
+桌面程序不会打开外置终端。右侧原生文本控件直接接收 Core 的流式事件；Markdown 暂按文本显示。Skill、DLL 插件、托盘、拖放、Explorer 集成和 MCP 不在本次 MVP 内。
+
+## 项目、会话与记忆
+
+**New project** 选择工作文件夹并命名；该项目的工具在这个文件夹执行。左侧树列出项目及各自的会话，**New chat** 在当前项目下创建独立对话，**Rename** 修改选中项的名称。切换会话会恢复过程记录与模型历史，不会把其他会话的对话自动混入。
+
+**Memory** 编辑当前项目共享的长期笔记，例如目标、约定和用户主动保存的结论。笔记在同一项目的各会话中使用，其他项目看不到。它是用户明确维护的记忆，程序不会把临时回答自动当作事实保存。
+
+桌面数据保存在程序目录的 `data/library.json`，包含项目、会话原始消息、公开思考文本及工具过程。写入采用同目录临时文件、刷新和原子替换；数据目录已被 Git 忽略。一个数据目录只允许一个 Core 写入，损坏的数据不会被自动重置。退出或 Stop 后，下次启动恢复已完成的对话；Core 已接收的中断轮次保留过程标记，未完成的工具调用不会作为有效模型历史回放。整库最多 32 MiB、每会话过程记录最多 4 MiB，达到限制会明确报错，不会自动删除旧历史。
+
+发送给模型的是有界上下文：项目系统提示、项目笔记、旧轮次摘录和最近完整轮次。`ContextBytes=65536` 默认限制消息 JSON 的 UTF-8 字节数，可配置为 16384–262144。工具调用和结果按完整轮次保留，旧工具输出可在模型输入中截短，磁盘原始记录不受影响。旧轮次摘录不是语义总结，也不是无限记忆；不会为此额外调用云模型。当前完整轮次无法放入预算时会明确报错。
 
 ## 构建与运行
 
@@ -45,7 +56,7 @@ Model=your-model
 
 `ApiUrl` 必须是完整的 HTTP/HTTPS Chat Completions 端点；程序不拼接路径，不内置服务商地址。`ApiKey` 使用 Bearer 认证，不需要认证的本地服务可以留空。模型需支持 `messages`、`tools` 和 `tool_calls`；不直接支持其他协议（例如 Anthropic Messages 或 Responses）。不自动跟随重定向，请填写最终端点。
 
-旧版 `[OpenRouter]` 配置需要改为 `[LLM]` 并填写地址；不再默认发送 Provider、Effort、DataCollection、ZeroDataRetention 或缓存扩展参数。可选 `ExtraBody` 为一行 JSON 对象，用于服务商的思考开关等参数；不能覆盖 `model`、`messages`、`tools`、`stream`。可选 `ContextWindow` 仅供 CLI 显示上下文统计。保存后点击 **Stop**，再发送消息以重新载入配置；命令行则退出后重启。不要提交含密钥的 INI 文件。
+旧版 `[OpenRouter]` 配置需要改为 `[LLM]` 并填写地址；不再默认发送 Provider、Effort、DataCollection、ZeroDataRetention 或缓存扩展参数。可选 `ExtraBody` 为一行 JSON 对象，用于服务商的思考开关等参数；不能覆盖 `model`、`messages`、`tools`、`stream`。`Stream=1` 默认开启桌面与 CLI 流式输出；`Stream=0` 使用完整 JSON 响应。可选 `ContextWindow` 仅供 CLI 显示上下文统计。桌面 **Settings** 保存配置后，下次请求重启 Core 应用设置并恢复会话；命令行则退出后重启。不要提交含密钥的 INI 文件。
 
 ### 命令行与 DeepSeek
 
@@ -67,12 +78,12 @@ ExtraBody={"thinking":{"type":"enabled"},"reasoning_effort":"high"}
 ### 当前 Agent 能力
 
 - 多轮对话与多轮工具调用：支持。每次提问最多 24 次模型请求，每个响应最多 16 个工具调用；当前仅有 `cmd` 工具，按顺序执行，结果回传模型。
-- 深度思考展示：命令行支持流式 `reasoning_content`（也接受文本 `reasoning`），回答和工具参数的碎片会正确拼接。缺失完成标记、中断或错误的响应不会执行其中的工具，失败轮次会从历史移除。桌面窗口仍采用完整 JSON 请求，仅显示状态、工具命令和最终回答。
+- 深度思考展示：桌面与命令行支持流式 `reasoning_content`（也接受文本 `reasoning`），回答和工具参数的碎片会正确拼接。缺失完成标记、中断或错误的响应不会执行其中的工具，失败轮次不会进入有效模型历史。桌面右侧依次显示思考、回答、工具命令、stdin、结果和退出码。
 - MCP：未实现，没有 MCP 协议客户端、服务器配置或工具发现。
 
 上游附带的 libcurl 使用 OpenSSL；这里保留证书验证与 CA 文件，不改用 Windows 系统 TLS。实际联网能力仍需在目标 XP 机器验证。不要仅凭 `_WIN32_WINNT` 或 PE 子系统版本判断兼容性。
 
-工作目录为应用所在目录；继承的 `cmd` 工具会以当前用户权限执行命令，并非沙箱。聊天文本经 UTF-8 管道传输；目录提示已转换为 UTF-8。工具命令、stdin 和输出仍沿用上游编码，MVP 文件工具仅支持 ASCII 路径与文本命令，建议安装到 `C:\XP-Harness-Desktop`。工具输出捕获上限为 4 MiB，超限结束该命令（exit 122）。
+桌面工具工作目录为所选项目文件夹，默认项目与 CLI 使用应用目录；继承的 `cmd` 工具以当前用户权限执行命令，并非沙箱。聊天文本和目录提示使用 UTF-8；桌面将非 UTF-8 工具输出按系统 OEM 代码页转换。工具命令和 stdin 仍沿用上游编码，建议使用 ASCII 路径与文本命令，并安装到 `C:\XP-Harness-Desktop`；无法用系统 ANSI 代码页表示的项目路径会明确拒绝。工具输出捕获上限为 4 MiB，超限结束该命令（exit 122）。
 
 ## 代码位置
 
@@ -80,12 +91,13 @@ ExtraBody={"thinking":{"type":"enabled"},"reasoning_effort":"high"}
 | --- | --- |
 | `src/main.c` | 复用上游模型、工具、会话与 CLI，补充必要校验 |
 | `src/agent_mode.inc` | 桌面模式入口，复用同一份 Agent 实现 |
-| `src/stream.inc` | 命令行 SSE 增量解析、思考/回答输出和工具参数拼接 |
-| `src/desktop.c` | 一个 Win32 窗口与后台通信线程 |
+| `src/stream.inc` | 桌面/CLI 共用 SSE 增量解析、思考/回答输出和工具参数拼接 |
+| `src/memory.inc` | 本地项目/会话库、原子保存与上下文投影 |
+| `src/desktop.c` | 原生项目树、聊天与记忆编辑、后台通信线程 |
 | `src/ipc.c` / `src/ipc.h` | 长度前缀、256 KiB 上限、可取消 I/O、当前登录会话 ACL |
 | `src/cJSON.*` / `dep/` | 上游依赖 |
 
-IPC 为 4 字节小端长度加 UTF-8 JSON；单连接、单次请求。请求类型为 `chat`（带 `text`）、`reset`、`shutdown`；事件类型为 `status`、`assistant`、`tool`、`error`、`done`。这是内部 MVP 协议，不引入通用 RPC 或插件协议。
+IPC 为 4 字节小端长度加 UTF-8 JSON，单连接、请求顺序执行。`library` 列出项目/会话，`open` 恢复会话；`new_project`、`new_chat`、`rename`、`memory` 管理本地数据。`chat` 带会话 `id`、`text` 和 `stream:true`；旧客户端不带 `stream` 时仍用完整 JSON。过程事件包含 `reasoning_delta`、`answer_delta`、`tool`、`tool_stdin`、`tool_result`、`context`、`error`，每个请求以 `done` 结束。`reset` 与 `shutdown` 保留兼容。这是内部 MVP 协议，不引入通用 RPC 或插件协议。
 
 ## 验证
 
@@ -95,8 +107,9 @@ IPC 为 4 字节小端长度加 UTF-8 JSON；单连接、单次请求。请求�
 & .\tests\build-host.ps1 -Zig 'C:\tools\zig\zig.exe'
 python tests\smoke.py build\host\AgentCore.exe
 python tests\stream_smoke.py build\host\AgentCore.exe
+python tests\desktop_memory_smoke.py build\host\AgentCore.exe
 ```
 
-这些测试不需要真实 API Key、不请求云端模型。原生测试覆盖响应校验与 IPC；smoke 测试运行本地 HTTP 模拟服务，检查自定义地址、可选认证、两轮无害 `echo` 工具调用与后续对话历史。stream_smoke 检查回复完成前的实时输出、碎片化 SSE/UTF-8/工具参数、思考历史回传、流中断/HTTP 错误后的恢复。`build\host` 是开发验证产物，不是经过认证的 XP 发布包。
+这些测试不需要真实 API Key、不请求云端模型。原生测试覆盖响应校验与 IPC；smoke 测试检查自定义地址、可选认证、两轮无害 `echo` 工具调用与后续历史；stream_smoke 检查实时输出、碎片化 SSE 与错误恢复；desktop_memory_smoke 检查项目/会话与笔记隔离、工作目录、重启和 Stop 恢复、上下文预算、完整历史、长回复跨帧恢复、库锁与损坏/保存失败保护。`build\host` 是开发验证产物，不是经过认证的 XP 发布包。
 
 当前验证结果见 [VALIDATION.md](VALIDATION.md)。

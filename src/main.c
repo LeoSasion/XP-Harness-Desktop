@@ -56,19 +56,17 @@ static void dbg(FILE **fp, const char *filename, const char *fmt, ...) {
 //
 // CONFIGURATION
 
-#define APIKEY_MAX 128
+#define APIKEY_MAX 512
+#define APIURL_MAX 2048
 #define MODEL_MAX 255
 
 struct config_t {
     char cwd[MAX_PATH];
 
-    // OpenRouter config
+    // Chat Completions configuration
     char api_key[APIKEY_MAX];
     char model[MODEL_MAX];
-    char provider[255];
-    char effort[12]; // max, xhigh, high, medium, low, minimial, none
-    int datacoll;
-    int zdr;
+    char api_url[APIURL_MAX];
 
     // Exa config
     char exa_key[APIKEY_MAX];
@@ -84,15 +82,12 @@ void config_init(struct config_t *config, const char *ini_file) {
     GetCurrentDirectoryA(MAX_PATH, config->cwd);
     _snprintf(ini_path, MAX_PATH, "%s\\%s", config->cwd, ini_file);
 
-    GetPrivateProfileStringA("OpenRouter", "ApiKey", "", config->api_key, APIKEY_MAX, ini_path);
-    GetPrivateProfileStringA("OpenRouter", "Model", "deepseek/deepseek-v4-flash", config->model, MODEL_MAX, ini_path);
-    GetPrivateProfileStringA("OpenRouter", "Provider", "", config->provider, sizeof(config->provider), ini_path);
-    GetPrivateProfileStringA("OpenRouter", "Effort", "none", config->effort, sizeof(config->effort), ini_path);
-    config->datacoll = GetPrivateProfileIntA("OpenRouter", "DataCollection", 0, ini_path);
-    config->zdr = GetPrivateProfileIntA("OpenRouter", "ZeroDataRetention", 0, ini_path);
+    GetPrivateProfileStringA("LLM", "ApiUrl", "", config->api_url, APIURL_MAX, ini_path);
+    GetPrivateProfileStringA("LLM", "ApiKey", "", config->api_key, APIKEY_MAX, ini_path);
+    GetPrivateProfileStringA("LLM", "Model", "", config->model, MODEL_MAX, ini_path);
     GetPrivateProfileStringA("Exa", "ApiKey", "", config->exa_key, APIKEY_MAX, ini_path);
     if (config->exa_key[0]) SetEnvironmentVariableA("EXA_API_KEY", config->exa_key);
-    config->context = 0;
+    config->context = GetPrivateProfileIntA("LLM", "ContextWindow", 0, ini_path);
 }
 
 //////////////////////////////////////////////////////////////////////////
@@ -610,16 +605,10 @@ struct conversation_t {
     double cost;
 };
 
-static const char *session_id(void) {
-    static char id[40];
-    if (!id[0]) _snprintf(id, sizeof(id), "vc6ai-%lu-%lu", GetCurrentProcessId(), GetTickCount());
-    return id;
-}
-
 void convo_init(struct conversation_t *convo, struct config_t *config, const struct tool_t *tooldefs) {
     const struct tool_t *tooldef;
     const struct tool_params_t *paramdef;
-    cJSON *messages, *provider, *cache;
+    cJSON *messages;
     cJSON *tools, *tool, *func, *params, *props, *prop, *reqs;
     cJSON *root = cJSON_CreateObject();
     int i, j;
@@ -664,37 +653,10 @@ void convo_init(struct conversation_t *convo, struct config_t *config, const str
     printf("\n\n");
 
     cJSON_AddStringToObject(root, "model", config->model);
-    cJSON_AddStringToObject(root, "session_id", session_id());
-    cJSON_AddStringToObject(root, "prompt_cache_key", session_id());
-
-    // enable prompt caching
-    cache = cJSON_CreateObject();
-    cJSON_AddStringToObject(cache, "type", "ephemeral");
-    cJSON_AddItemToObject(root, "cache_control", cache);
     cJSON_AddItemToObject(root, "tools", tools);
 
     messages = cJSON_CreateArray();
     cJSON_AddItemToObject(root, "messages", messages);
-
-    // add provider section
-    provider = cJSON_CreateObject();
-    if (!config->datacoll) cJSON_AddStringToObject(provider, "data_collection", "deny");
-    if (config->zdr) cJSON_AddBoolToObject(provider, "zdr", cJSON_True); // zero data retention
-    if (strlen(config->provider)) {
-        cJSON *order = cJSON_CreateArray();
-        cJSON_AddItemToArray(order, cJSON_CreateString(config->provider));
-        cJSON_AddItemToObject(provider, "order", order);
-        cJSON_AddBoolToObject(provider, "allow_fallbacks", cJSON_False);
-    }
-    cJSON_AddItemToObject(root, "provider", provider);
-
-    // enable reasoning
-    if (strncmp(config->effort, "none", 4)) {
-        cJSON *reasoning = cJSON_CreateObject();
-        cJSON_AddStringToObject(reasoning, "effort", config->effort);
-        cJSON_AddBoolToObject(reasoning, "exclude", cJSON_False); // keep traces for tool call continuity
-        cJSON_AddItemToObject(root, "reasoning", reasoning);
-    }
 
     memset(convo, 0, sizeof(struct conversation_t));
     convo->root = root;
@@ -873,49 +835,29 @@ void convo_cleanup(struct conversation_t *convo) {
 
 //////////////////////////////////////////////////////////////////////////
 //
-// OPENROUTER INTERACTIONS
+// CHAT COMPLETIONS HTTP
 
-void openrouter_init(struct http_context_t *ctx, const char *api_key) {
+void llm_init(struct http_context_t *ctx, const struct config_t *config) {
     char buf[APIKEY_MAX + 32];
     
-    _snprintf(buf, sizeof(buf), "Authorization: Bearer %s", api_key);
-    ctx->headers = curl_slist_append(ctx->headers, buf);
+    if (config->api_key[0]) {
+        _snprintf(buf, sizeof(buf), "Authorization: Bearer %s", config->api_key);
+        ctx->headers = curl_slist_append(ctx->headers, buf);
+    }
     ctx->headers = curl_slist_append(ctx->headers, "Content-Type: application/json");
-    ctx->headers = curl_slist_append(ctx->headers, "HTTP-Referer: https://github.com/LeoSasion/XP-Harness-Desktop");
-    ctx->headers = curl_slist_append(ctx->headers, "X-Title: XP-Harness-Desktop");
+    curl_easy_setopt(ctx->curl, CURLOPT_URL, config->api_url);
+    curl_easy_setopt(ctx->curl, CURLOPT_PROTOCOLS, CURLPROTO_HTTP | CURLPROTO_HTTPS);
+    curl_easy_setopt(ctx->curl, CURLOPT_FOLLOWLOCATION, 0L);
 
     curl_easy_setopt(ctx->curl, CURLOPT_HTTPHEADER, ctx->headers);
 }
 
-void openrouter_fetch_limits(struct http_context_t *ctx, struct config_t *config) {
-    char model[MODEL_MAX], url[MODEL_MAX + 64], *p;
-    CURLcode res;
-    cJSON *root, *data, *endpoints, *endpoint, *length;
-
-    ctx->reslen = 0;
-    if (ctx->res) ctx->res[0] = '\0';
-
-    // model variant suffixes like :nitro are not part of the endpoints URL
-    strcpy(model, config->model);
-    if ((p = strchr(model, ':')) != NULL) *p = '\0';
-    _snprintf(url, sizeof(url), "https://openrouter.ai/api/v1/models/%s/endpoints", model);
-
-    curl_easy_setopt(ctx->curl, CURLOPT_URL, url);
-    curl_easy_setopt(ctx->curl, CURLOPT_HTTPGET, 1L);
-    res = curl_easy_perform(ctx->curl);
-    if (res != CURLE_OK) return; // model context stays unknown
-
-    // get model's context window from response
-    root = cJSON_Parse(ctx->res);
-    data = cJSON_GetObjectItemCaseSensitive(root, "data");
-    endpoints = cJSON_GetObjectItemCaseSensitive(data, "endpoints");
-    endpoint = cJSON_GetArrayItem(endpoints, 0);
-    length = cJSON_GetObjectItemCaseSensitive(endpoint, "context_length");
-    if (cJSON_IsNumber(length)) config->context = length->valueint;
-    cJSON_Delete(root);
+static int llm_configured(const struct config_t *config) {
+    return config->model[0] &&
+        (!strncmp(config->api_url, "https://", 8) || !strncmp(config->api_url, "http://", 7));
 }
 
-CURLcode openrouter_request(struct http_context_t *ctx, struct conversation_t *convo) {
+CURLcode llm_request(struct http_context_t *ctx, struct conversation_t *convo) {
     CURLcode res;
     char *payload = cJSON_PrintUnformatted(convo->root);
 
@@ -930,7 +872,6 @@ CURLcode openrouter_request(struct http_context_t *ctx, struct conversation_t *c
     ctx->reslen = 0;
     if (ctx->res) ctx->res[0] = '\0';
 
-    curl_easy_setopt(ctx->curl, CURLOPT_URL, "https://openrouter.ai/api/v1/chat/completions");
     curl_easy_setopt(ctx->curl, CURLOPT_POSTFIELDS, payload);
     res = curl_easy_perform(ctx->curl);
     free(payload);
@@ -1040,6 +981,10 @@ int main(int argc, char **argv) {
     if (argc > 1 && !strcmp(argv[1], "--pipe")) return agent_main(argc, argv);
     term_init();
     config_init(&config, ini_file);
+    if (!llm_configured(&config)) {
+        fprintf(stderr, "Set [LLM] ApiUrl (full http/https endpoint) and Model in vc6ai.ini.\n");
+        return 1;
+    }
 
     // fancy title with background grad
     printf("\n ");
@@ -1058,8 +1003,7 @@ int main(int argc, char **argv) {
     convo_add_sysprompt(&convo, &config);
 
     http_init(&http, 600L); // 10 minute timeout to allow for longer thinking sessions
-    openrouter_init(&http, config.api_key);
-    openrouter_fetch_limits(&http, &config);
+    llm_init(&http, &config);
 
     for (;;) {
 prompt:
@@ -1097,14 +1041,10 @@ prompt:
                     lstrcpynA(config.model, arg, MODEL_MAX);
                     cJSON_ReplaceItemInObject(convo.root, "model", cJSON_CreateString(config.model));
                     config.context = 0;
-                    openrouter_fetch_limits(&http, &config);
                 }
                 term_reset();
                 printf("  \257 current model: %s\n", config.model);
-                printf("    reasoning: %s\n", config.effort);
                 if (config.context > 0) printf("    context window: %d\n", config.context);
-                printf("    data collection: %s\n", config.datacoll ? "allowed" : "denied");
-                printf("    zero data retention: %s\n\n", config.zdr ? "enabled" : "disabled");
                 goto prompt;
             } else if (!strncmp(&prompt[1], "stats", 5)) {
                 term_reset();
@@ -1152,7 +1092,7 @@ prompt:
 
 request:
         // send user message to LLM
-        if (openrouter_request(&http, &convo)) {
+        if (llm_request(&http, &convo)) {
             if (term_interrupted()) {
                 term_interrupt_reset();
                 printf("  ~ interrupted\n\n");

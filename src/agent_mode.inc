@@ -41,7 +41,7 @@ static int agent_main(int argc, char **argv) {
         goto cleanup;
     }
     initialized = 1;
-    openrouter_init(&http, config.api_key);
+    llm_init(&http, &config);
     /* No model metadata fetch: starting the desktop must not issue a request. */
     while (!term_interrupted() && ipc_read(agent_pipe, &frame, agent_parent, INFINITE)) {
         request = cJSON_ParseWithOpts(frame, NULL, 1);
@@ -59,8 +59,8 @@ static int agent_main(int argc, char **argv) {
             agent_emit("error", "Unknown request type.");
         } else if (!cJSON_IsString(text) || !text->valuestring[0] || strlen(text->valuestring) > 65536) {
             agent_emit("error", "Chat text must contain 1 to 65536 UTF-8 bytes.");
-        } else if (!config.api_key[0]) {
-            agent_emit("error", "OpenRouter API key is missing. Edit vc6ai.ini, then click Stop before sending again.");
+        } else if (!llm_configured(&config)) {
+            agent_emit("error", "Set [LLM] ApiUrl (full http/https endpoint) and Model. Edit vc6ai.ini, then click Stop before sending again.");
         } else {
             before = cJSON_GetArraySize(convo.messages);
             success = 0;
@@ -68,7 +68,7 @@ static int agent_main(int argc, char **argv) {
             convo_add_text_message(&convo, "user", text->valuestring);
             agent_emit("status", "Thinking...");
             for (round = 0; round < 24 && !term_interrupted(); ++round) {
-                if (openrouter_request(&http, &convo)) break;
+                if (llm_request(&http, &convo)) break;
                 status = convo_add_response(&convo, http.res);
                 if (status < 0) break;
                 if (!status) { agent_emit("assistant", convo.content); success = 1; break; }

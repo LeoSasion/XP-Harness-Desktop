@@ -10,7 +10,7 @@ $flags = @('cc', '-target', 'x86-windows-gnu', '-std=gnu89', '-Os', '-fms-extens
 $shared = @("$root\src\cJSON.c", "$root\src\ipc.c", '-luser32', '-ladvapi32')
 & $Zig @flags "$root\src\main.c" @shared "$root\dep\curl-8.20\lib\libcurl.lib" '-o' "$out\AgentCore.exe"
 if ($LASTEXITCODE) { throw 'AgentCore compilation failed' }
-& $Zig @flags "$root\src\desktop.c" @shared '-lgdi32' '-lshell32' '-Wl,--subsystem,windows' '-o' "$out\XP-Harness-Desktop.exe"
+& $Zig @flags "$root\src\desktop.c" @shared '-lgdi32' '-lshell32' '-lole32' '-lcomctl32' '-Wl,--subsystem,windows' '-o' "$out\XP-Harness-Desktop.exe"
 if ($LASTEXITCODE) { throw 'Desktop compilation failed' }
 & $Zig @flags "$root\tests\native_tests.c" @shared "$root\dep\curl-8.20\lib\libcurl.lib" '-o' "$out\native_tests.exe"
 if ($LASTEXITCODE) { throw 'Native test compilation failed' }

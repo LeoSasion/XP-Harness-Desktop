@@ -128,33 +128,39 @@ def check_custom_api(directory):
     try:
         for key in ('mock-key', ''):
             requests.clear()
-            (directory / 'vc6ai.ini').write_text(
-                f'[LLM]\nApiUrl=http://127.0.0.1:{server.server_port}/custom/chat/completions?test=1\n'
-                f'ApiKey={key}\nModel=mock-model\n', encoding='ascii')
-            core = Core(directory)
-            try:
-                assert not requests, 'Startup must not fetch provider metadata'
-                events = core.turn({'type': 'chat', 'text': 'test tools'})
-                assert [e['text'] for e in events if e['type'] == 'assistant'] == ['mock reply'], events
-                assert len([e for e in events if e['type'] == 'tool']) == 2, events
-                events = core.turn({'type': 'chat', 'text': 'follow up'})
-                assert any(e['type'] == 'assistant' for e in events), events
-                assert len(requests) == 4, requests
-                for path, auth, body in requests:
-                    assert path == '/custom/chat/completions?test=1', path
-                    assert auth == ('Bearer mock-key' if key else None), auth
-                    assert body['model'] == 'mock-model', body
-                    assert set(body) == {'model', 'messages', 'tools'}, body.keys()
-                messages = requests[2][2]['messages']
-                outputs = [m for m in messages if m['role'] == 'tool']
-                assert [m['tool_call_id'] for m in outputs] == ['call_1', 'call_2'], outputs
-                assert all(f'mock-{i}' in m['content'] and '[exit 0]' in m['content']
-                           for i, m in enumerate(outputs, 1)), outputs
-                assert requests[3][2]['messages'][-2:] == [
-                    {'role': 'assistant', 'content': 'mock reply'},
-                    {'role': 'user', 'content': 'follow up'}]
-            finally:
-                core.close()
+            # Desktop history now persists across processes. Keep each auth
+            # case independent without weakening the original history checks.
+            with tempfile.TemporaryDirectory(prefix='vc6ai-custom-api-') as tmp:
+                case_directory = Path(tmp)
+                for name in ('AgentCore.exe', 'libcurl-4.dll', 'curl-ca-bundle.crt'):
+                    shutil.copy2(directory / name, case_directory / name)
+                (case_directory / 'vc6ai.ini').write_text(
+                    f'[LLM]\nApiUrl=http://127.0.0.1:{server.server_port}/custom/chat/completions?test=1\n'
+                    f'ApiKey={key}\nModel=mock-model\n', encoding='ascii')
+                core = Core(case_directory)
+                try:
+                    assert not requests, 'Startup must not fetch provider metadata'
+                    events = core.turn({'type': 'chat', 'text': 'test tools'})
+                    assert [e['text'] for e in events if e['type'] == 'assistant'] == ['mock reply'], events
+                    assert len([e for e in events if e['type'] == 'tool']) == 2, events
+                    events = core.turn({'type': 'chat', 'text': 'follow up'})
+                    assert any(e['type'] == 'assistant' for e in events), events
+                    assert len(requests) == 4, requests
+                    for path, auth, body in requests:
+                        assert path == '/custom/chat/completions?test=1', path
+                        assert auth == ('Bearer mock-key' if key else None), auth
+                        assert body['model'] == 'mock-model', body
+                        assert set(body) == {'model', 'messages', 'tools'}, body.keys()
+                    messages = requests[2][2]['messages']
+                    outputs = [m for m in messages if m['role'] == 'tool']
+                    assert [m['tool_call_id'] for m in outputs] == ['call_1', 'call_2'], outputs
+                    assert all(f'mock-{i}' in m['content'] and '[exit 0]' in m['content']
+                               for i, m in enumerate(outputs, 1)), outputs
+                    assert requests[3][2]['messages'][-2:] == [
+                        {'role': 'assistant', 'content': 'mock reply'},
+                        {'role': 'user', 'content': 'follow up'}]
+                finally:
+                    core.close()
     finally:
         server.shutdown()
         server.server_close()

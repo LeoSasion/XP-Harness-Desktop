@@ -25,6 +25,10 @@ static int stream_append(cJSON *object, const char *key, cJSON *delta) {
 
 static void stream_print(struct stream_t *s, cJSON *text, int section) {
     if (!cJSON_IsString(text) || !text->valuestring[0]) return;
+    if (agent_pipe != INVALID_HANDLE_VALUE) {
+        agent_emit(section == 1 ? "reasoning_delta" : "answer_delta", text->valuestring);
+        return;
+    }
     if (s->section != section) {
         term_reset();
         printf("\n[%s]\n", section == 1 ? "Thinking" : "Answer");
@@ -48,6 +52,7 @@ static int stream_line(struct stream_t *s, char *line) {
         text = cJSON_GetObjectItemCaseSensitive(chunk, "error");
         text = cJSON_GetObjectItemCaseSensitive(text, "message");
         fprintf(stderr, "\nAPI stream error: %s\n", cJSON_IsString(text) ? text->valuestring : "Unknown error");
+        agent_emit("error", cJSON_IsString(text) ? text->valuestring : "Unknown API stream error");
         cJSON_Delete(chunk); return 0;
     }
     s->seen = 1;
@@ -137,7 +142,8 @@ static CURLcode stream_request(struct http_context_t *http, struct conversation_
     curl_easy_setopt(http->curl, CURLOPT_WRITEFUNCTION, http_write_callback);
     curl_easy_setopt(http->curl, CURLOPT_WRITEDATA, http);
     curl_easy_setopt(http->curl, CURLOPT_POSTFIELDS, NULL);
-    free(payload); term_reset(); printf("\n"); fflush(stdout);
+    free(payload);
+    if (agent_pipe == INVALID_HANDLE_VALUE) { term_reset(); printf("\n"); fflush(stdout); }
     if (result == CURLE_OK && s.seen) {
         if (!s.done || !cJSON_IsString(cJSON_GetObjectItemCaseSensitive(s.choice, "finish_reason")))
             result = CURLE_PARTIAL_FILE;
@@ -147,7 +153,10 @@ static CURLcode stream_request(struct http_context_t *http, struct conversation_
             else { free(http->res); http->res = json; http->reslen = strlen(json); }
         }
     }
-    if (result != CURLE_OK) fprintf(stderr, "Stream failed: %s\n", curl_easy_strerror(result));
+    if (result != CURLE_OK) {
+        fprintf(stderr, "Stream failed: %s\n", curl_easy_strerror(result));
+        agent_emit("error", curl_easy_strerror(result));
+    }
     http->streamed = s.seen;
     cJSON_Delete(s.reply);
     return result;

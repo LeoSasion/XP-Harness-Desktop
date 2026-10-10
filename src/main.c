@@ -21,6 +21,7 @@
 static HANDLE agent_pipe = INVALID_HANDLE_VALUE, agent_parent = NULL;
 static int agent_broken;
 static void agent_emit(const char *type, const char *text);
+static int mem_utf8(const char *text);
 
 //////////////////////////////////////////////////////////////////////////
 //
@@ -72,7 +73,7 @@ struct config_t {
     // Exa config
     char exa_key[APIKEY_MAX];
 
-    int stream; // CLI streaming only
+    int stream; // Incremental output in CLI and desktop modes
     int context; // model's context window
 };
 
@@ -508,6 +509,8 @@ char *tool_dispatch(struct config_t *config, const char *name, const char *args_
 
         stdin_json = cJSON_GetObjectItemCaseSensitive(args, "stdin");
         if (cJSON_IsString(stdin_json)) input = stdin_json->valuestring;
+        if (input) agent_emit("tool_stdin", input);
+        if (term_interrupted()) { cJSON_Delete(args); return strdup("Execution interrupted."); }
 
 #ifdef DEBUG_TOOLS
         DBG_TOOL("Tool call (%s): %s\n", name, cmd);
@@ -762,6 +765,9 @@ void convo_handle_tool_calls(struct conversation_t *convo, struct config_t *conf
     cJSON *tcs, *tc, *func;
     const char *id, *name, *args_json;
     char *content;
+    WCHAR *wide;
+    char *converted;
+    int count, bytes;
 
     if (!convo->pending_tool_msg) return;
 
@@ -774,9 +780,26 @@ void convo_handle_tool_calls(struct conversation_t *convo, struct config_t *conf
         args_json = cJSON_GetObjectItemCaseSensitive(func, "arguments")->valuestring;
  
         content = tool_dispatch(config, name, args_json);
+        /* cmd utilities may return OEM bytes. Keep desktop history valid UTF-8. */
+        if (agent_pipe != INVALID_HANDLE_VALUE && content && !mem_utf8(content)) {
+            count = MultiByteToWideChar(CP_OEMCP, 0, content, -1, NULL, 0);
+            wide = count ? malloc(count * sizeof(WCHAR)) : NULL;
+            converted = NULL;
+            if (wide && MultiByteToWideChar(CP_OEMCP, 0, content, -1, wide, count)) {
+                bytes = WideCharToMultiByte(CP_UTF8, 0, wide, -1, NULL, 0, NULL, NULL);
+                converted = bytes ? malloc(bytes) : NULL;
+                if (converted && !WideCharToMultiByte(CP_UTF8, 0, wide, -1, converted, bytes, NULL, NULL)) {
+                    free(converted); converted = NULL;
+                }
+            }
+            free(wide); free(content); content = converted;
+        }
+        if (!content) content = strdup("Tool failed: out of memory.");
+        if (!content) { agent_emit("error", "Tool result allocation failed."); agent_broken = 1; break; }
         if (agent_pipe == INVALID_HANDLE_VALUE && content) {
             printf("[Tool result: %s]\n", id); term_write_utf8(content); printf("\n"); fflush(stdout);
         }
+        if (content) agent_emit("tool_result", content);
         convo_add_tool_message(convo, id, content);
         free(content);
     }
@@ -808,7 +831,7 @@ void llm_init(struct http_context_t *ctx, const struct config_t *config) {
     curl_easy_setopt(ctx->curl, CURLOPT_PROTOCOLS, CURLPROTO_HTTP | CURLPROTO_HTTPS);
     curl_easy_setopt(ctx->curl, CURLOPT_FOLLOWLOCATION, 0L);
 
-    ctx->stream = config->stream && agent_pipe == INVALID_HANDLE_VALUE;
+    ctx->stream = config->stream;
     curl_easy_setopt(ctx->curl, CURLOPT_HTTPHEADER, ctx->headers);
 }
 
@@ -914,6 +937,7 @@ static const char *path_utf8(const char *path, char *utf8) {
 void convo_add_sysprompt(struct conversation_t *convo, struct config_t *config) {
     char buf[SYSPROMPT_MAX];
     char utf8[MAX_PATH * 3];
+    char path[MAX_PATH + 16];
     struct _finddata_t fd;
     long h;
     int n;
@@ -923,7 +947,9 @@ void convo_add_sysprompt(struct conversation_t *convo, struct config_t *config) 
     n = prompt_append(buf, 0, "%s\nCurrent directory: %s\nCurrent directory contents:", sysprompt, path_utf8(config->cwd, utf8));
     
     // add cwd content
-    h = _findfirst("*", &fd);
+    _snprintf(path, sizeof(path), "%s\\*", config->cwd);
+    path[sizeof(path) - 1] = 0;
+    h = _findfirst(path, &fd);
     if (h != -1) { do {
         if (fd.name[0] == '.') continue;
         n = prompt_append(buf, n, " %s%s", path_utf8(fd.name, utf8), (fd.attrib & _A_SUBDIR) ? "/" : "");
@@ -931,7 +957,9 @@ void convo_add_sysprompt(struct conversation_t *convo, struct config_t *config) 
     _findclose(h); }
 
     // add AGENTS.md contents if exists
-    f = fopen("AGENTS.md", "rb");
+    _snprintf(path, sizeof(path), "%s\\AGENTS.md", config->cwd);
+    path[sizeof(path) - 1] = 0;
+    f = fopen(path, "rb");
     if (f) {
         n = prompt_append(buf, n, "\n\nInstructions from AGENTS.md:\n---\n");
         if (n < SYSPROMPT_MAX - 8) n += fread(buf + n, 1, SYSPROMPT_MAX - n - 8, f);

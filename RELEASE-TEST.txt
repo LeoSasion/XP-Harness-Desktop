@@ -1,0 +1,31 @@
+XP-Harness-Desktop - Windows XP test build
+
+1. Extract the entire ZIP to a writable local folder, e.g. C:\XP-Harness.
+2. Edit vc6ai.ini in Notepad. Set ApiUrl to the FULL Chat Completions URL,
+   ApiKey to your own key, and Model to the provider's model name.
+   For DeepSeek: https://api.deepseek.com/chat/completions
+   Model: deepseek-chat (or deepseek-reasoner). Keep Stream=1.
+3. Run XP-Harness-Desktop.exe. Keep AgentCore.exe and all DLLs/tools beside it.
+   No installation and no Python/Node/VC6 runtime are needed on the test PC.
+
+Please test on Windows XP SP3 (32-bit):
+- Open the app, create a project/session, send a message, see streamed output.
+- Restart the app and confirm sessions/project notes are preserved.
+- Drag files into the draft, export a session, delete a disposable session.
+- Approve/deny a harmless tool command; stop a running request.
+- Interrupt a task, restart, and check recovery without automatic tool replay.
+
+Build: MinGW-w64 GCC 8.1.0 i686, MSVCRT, static compiler runtime, Pentium III
+code generation, OS/subsystem 5.1. Bundled tools have their own CPU requirements.
+This is a prerelease; it has NOT yet been run on a real XP machine.
+Static PE/import checks and offline tests on the build PC do not prove XP
+compatibility. TLS/network behavior also needs testing on your XP machine.
+Keep certificate verification enabled; ensure the system date/time is correct.
+
+Configuration contains NO key. Conversations and notes are saved in data\.
+Do not share vc6ai.ini or data\ when reporting an issue. For a startup error,
+record the full missing-DLL/function message and your XP service pack/CPU.
+
+Source/build script: https://github.com/LeoSasion/XP-Harness-Desktop
+Third-party licenses: LICENSE, NOTICE and licenses\.
+Corresponding BusyBox source is provided as a separate asset on this release.

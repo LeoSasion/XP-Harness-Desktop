@@ -229,6 +229,8 @@ static int agent_main(int argc, char **argv) {
         else if (!strcmp(type, "open")) ok = mem_open(id, &config, &convo, 1);
         else if (!strcmp(type, "new_project")) ok = mem_create_project(text, mem_string(request, "path"), &config, &convo);
         else if (!strcmp(type, "new_chat")) ok = mem_create_chat(mem_string(request, "project"), text, &config, &convo);
+        else if (!strcmp(type, "delete_chat")) ok = mem_delete_chat(id, &config, &convo);
+        else if (!strcmp(type, "export_chat")) ok = mem_export_chat(id, mem_string(request, "path"));
         else if (!strcmp(type, "rename")) ok = mem_change(id, text, 0);
         else if (!strcmp(type, "memory")) ok = mem_change(NULL, text, 1);
         else if (!strcmp(type, "reset")) ok = mem_reset(&convo);

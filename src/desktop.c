@@ -5,6 +5,7 @@
 #define _UNICODE
 #include <windows.h>
 #include <commctrl.h>
+#include <commdlg.h>
 #include <shellapi.h>
 #include <shlobj.h>
 #include <wincrypt.h>
@@ -24,6 +25,8 @@
 #define ID_RENAME 106
 #define ID_MEMORY 107
 #define ID_TREE 108
+#define ID_EXPORT 109
+#define ID_DELETE 118
 #define WM_EVENT (WM_APP + 1)
 #define EV_PROTOCOL 1
 #define EV_FINISH 2
@@ -54,7 +57,7 @@ static char section[24];
 static cJSON *catalog, *session;
 static LONG serial, pending_serial;
 static int busy, stopping, closing, rebuilding, bootstrap, request_failed;
-static int reload_settings, pending_reload, request_is_chat;
+static int reload_settings, pending_reload, request_is_chat, request_is_export;
 static void show_permission(const char *text);
 
 static const char *string_value(const cJSON *object, const char *key) {
@@ -258,6 +261,7 @@ static int queue_request(cJSON *message) {
     int is_chat;
     if (!message) return 0;
     is_chat = !strcmp(string_value(message, "type"), "chat");
+    request_is_export = !strcmp(string_value(message, "type"), "export_chat");
     request = cJSON_PrintUnformatted(message); cJSON_Delete(message);
     if (!request) return 0;
     if (busy || closing) { free(request); return 0; }
@@ -546,6 +550,78 @@ static void open_settings(void) {
         SetWindowTextW(status_label, L"Save settings before the next action. Sessions and project memory are retained."); }
 }
 
+static void chat_action(const char *id, int action) {
+    OPENFILENAMEW dialog;
+    WCHAR path[MAX_PATH] = L"conversation.json";
+    char *utf8;
+    cJSON *message;
+    if (busy || closing) return;
+    if (action == ID_DELETE) {
+        if (MessageBoxW(window, L"Delete this session and its saved history?\nProject files and shared notes are kept.",
+                        L"Delete session", MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) != IDYES) return;
+        message = request_type("delete_chat");
+    } else {
+        ZeroMemory(&dialog, sizeof(dialog)); dialog.lStructSize = sizeof(dialog); dialog.hwndOwner = window;
+        dialog.lpstrFilter = L"JSON session (*.json)\0*.json\0\0"; dialog.lpstrDefExt = L"json";
+        dialog.lpstrFile = path; dialog.nMaxFile = MAX_PATH; dialog.lpstrTitle = L"Export session";
+        dialog.Flags = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR | OFN_HIDEREADONLY;
+        if (!GetSaveFileNameW(&dialog)) return;
+        utf8 = to_utf8(path); if (!utf8) return;
+        message = request_type("export_chat"); cJSON_AddStringToObject(message, "path", utf8); free(utf8);
+    }
+    cJSON_AddStringToObject(message, "id", id); queue_request(message);
+}
+
+static void chat_menu(LPARAM position) {
+    TVHITTESTINFO hit;
+    TVITEMW item;
+    RECT rect;
+    POINT point;
+    HMENU menu;
+    int action;
+    const char *id;
+    if (busy || closing) return;
+    point.x = (short)LOWORD(position); point.y = (short)HIWORD(position);
+    ZeroMemory(&item, sizeof(item)); item.mask = TVIF_PARAM;
+    if (position == (LPARAM)-1) {
+        item.hItem = TreeView_GetSelection(tree);
+        if (!item.hItem || !TreeView_GetItemRect(tree, item.hItem, &rect, TRUE)) return;
+        point.x = rect.left; point.y = rect.bottom; ClientToScreen(tree, &point);
+    } else {
+        ZeroMemory(&hit, sizeof(hit)); hit.pt = point; ScreenToClient(tree, &hit.pt);
+        item.hItem = TreeView_HitTest(tree, &hit);
+    }
+    if (!item.hItem || !SendMessageW(tree, TVM_GETITEMW, 0, (LPARAM)&item) ||
+        !*string_value((cJSON *)item.lParam, "project")) return;
+    id = string_value((cJSON *)item.lParam, "id");
+    menu = CreatePopupMenu(); if (!menu) return;
+    AppendMenuW(menu, MF_STRING, ID_EXPORT, L"&Export session...");
+    AppendMenuW(menu, MF_STRING, ID_DELETE, L"&Delete session...");
+    action = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON, point.x, point.y, 0, window, NULL);
+    DestroyMenu(menu);
+    if (action) chat_action(id, action);
+}
+
+/* Draft paths only: no file read, upload or model request on drop. */
+static void drop_files(HDROP drop) {
+    WCHAR draft[INPUT_LIMIT + 1], path[MAX_PATH];
+    UINT i, count = DragQueryFileW(drop, (UINT)-1, NULL, 0), length;
+    int used = GetWindowTextW(input, draft, INPUT_LIMIT + 1), ok = !closing;
+    for (i = 0; i < count && ok; ++i) {
+        length = DragQueryFileW(drop, i, NULL, 0);
+        if (!length || length >= MAX_PATH || used + length + 4 > INPUT_LIMIT ||
+            !DragQueryFileW(drop, i, path, MAX_PATH)) { ok = 0; break; }
+        if (used) { draft[used++] = L'\r'; draft[used++] = L'\n'; }
+        draft[used++] = L'"'; memcpy(draft + used, path, length * sizeof(WCHAR)); used += length;
+        draft[used++] = L'"'; draft[used] = 0;
+    }
+    DragFinish(drop);
+    if (ok && count) {
+        SetWindowTextW(input, draft); SetFocus(input); SendMessageW(input, EM_SETSEL, (WPARAM)-1, (LPARAM)-1);
+        SetWindowTextW(status_label, L"Paths added to draft. Add your instruction, then Send; file reads still require tool approval.");
+    } else if (!closing) SetWindowTextW(status_label, L"Drop rejected: paths exceed MAX_PATH or the message limit. Draft kept; drop fewer files.");
+}
+
 static void system_colors(void) {
     TreeView_SetBkColor(tree, GetSysColor(COLOR_WINDOW)); TreeView_SetTextColor(tree, GetSysColor(COLOR_WINDOWTEXT));
     RedrawWindow(window, NULL, NULL, RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN);
@@ -575,7 +651,7 @@ static LRESULT CALLBACK window_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         path_label = control(hwnd, L"STATIC", L"Loading working folder...", SS_PATHELLIPSIS, 116);
         context_label = control(hwnd, L"STATIC", L"Loading saved session...", SS_LEFTNOWORDWRAP, 117);
         transcript = control(hwnd, L"EDIT", L"", ES_MULTILINE | ES_READONLY | WS_VSCROLL | ES_AUTOVSCROLL | WS_TABSTOP, 110);
-        input_label = control(hwnd, L"STATIC", L"&Message (Ctrl+Enter to send):", 0, 111);
+        input_label = control(hwnd, L"STATIC", L"&Message (Ctrl+Enter to send; drop files to add paths):", 0, 111);
         input = control(hwnd, L"EDIT", L"", ES_MULTILINE | ES_AUTOVSCROLL | ES_WANTRETURN | WS_VSCROLL | WS_TABSTOP, 112);
         send_button = control(hwnd, L"BUTTON", L"&Send", WS_TABSTOP | BS_DEFPUSHBUTTON, ID_SEND);
         stop_button = control(hwnd, L"BUTTON", L"S&top", WS_TABSTOP, ID_STOP);
@@ -583,7 +659,7 @@ static LRESULT CALLBACK window_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         if (!tree || !transcript || !input || !send_button || !status_label) return -1;
         SendMessageW(tree, CCM_SETUNICODEFORMAT, TRUE, 0);
         SendMessageW(input, EM_LIMITTEXT, INPUT_LIMIT, 0); SendMessageW(transcript, EM_LIMITTEXT, 1048576, 0);
-        system_colors(); return 0;
+        DragAcceptFiles(hwnd, TRUE); system_colors(); return 0;
     case WM_SIZE:
         if (wp == SIZE_MINIMIZED) return 0;
         GetClientRect(hwnd, &rect); width = rect.right; height = rect.bottom;
@@ -604,6 +680,10 @@ static LRESULT CALLBACK window_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_GETMINMAXINFO:
         limits = (MINMAXINFO *)lp; limits->ptMinTrackSize.x = 780; limits->ptMinTrackSize.y = 540; return 0;
     case WM_SETFOCUS: SetFocus(input); return 0;
+    case WM_CONTEXTMENU:
+        if ((HWND)wp == tree) { chat_menu(lp); return 0; }
+        break;
+    case WM_DROPFILES: drop_files((HDROP)wp); return 0;
     case WM_NOTIFY:
         if (((NMHDR *)lp)->idFrom == ID_TREE && ((NMHDR *)lp)->code == TVN_SELCHANGEDW && !rebuilding && !busy) {
             item = selection(); id = string_value(item, "id"); replace_string(&selected_id, id); enable_controls();
@@ -637,7 +717,8 @@ static LRESULT CALLBACK window_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 if (event->kind == EV_CANCELLED) {
                     begin_section("Interrupted"); append_text(L"Task cancelled. Saved conversation and project memory are retained.");
                     SetWindowTextW(status_label, L"Cancelled. Send resumes this saved session.");
-                } else SetWindowTextW(status_label, request_failed ? L"Request failed. Existing saved history is retained." : L"Ready. Ctrl+Enter sends.");
+                } else SetWindowTextW(status_label, request_failed ? L"Request failed. Existing saved history is retained." :
+                    request_is_export ? L"Session exported as UTF-8 JSON. Ready." : L"Ready. Ctrl+Enter sends.");
                 enable_controls();
                 if (bootstrap) { bootstrap = 0; if (!request_failed && active_id && *active_id) open_session(active_id); }
             }

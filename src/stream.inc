@@ -108,8 +108,11 @@ static int stream_line(struct stream_t *s, char *line) {
 static size_t stream_write(char *data, size_t size, size_t nmemb, void *userdata) {
     struct stream_t *s = userdata;
     size_t count = http_write_callback(data, size, nmemb, s->http), end;
+    long status = 0;
     char saved;
     if (!count) return 0;
+    curl_easy_getinfo(s->http->curl, CURLINFO_RESPONSE_CODE, &status);
+    if (status >= 300) return count; /* Never render or execute an HTTP error body as SSE. */
     while (s->parsed < s->http->reslen) {
         for (end = s->parsed; end < s->http->reslen && s->http->res[end] != '\n'; ++end) {}
         if (end == s->http->reslen) break; /* wait for the rest of this SSE line */
@@ -153,10 +156,7 @@ static CURLcode stream_request(struct http_context_t *http, struct conversation_
             else { free(http->res); http->res = json; http->reslen = strlen(json); }
         }
     }
-    if (result != CURLE_OK) {
-        fprintf(stderr, "Stream failed: %s\n", curl_easy_strerror(result));
-        agent_emit("error", curl_easy_strerror(result));
-    }
+    result = llm_finish(http, result);
     http->streamed = s.seen;
     cJSON_Delete(s.reply);
     return result;

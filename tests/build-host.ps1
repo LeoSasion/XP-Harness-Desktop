@@ -10,11 +10,15 @@ $flags = @('cc', '-target', 'x86-windows-gnu', '-std=gnu89', '-Os', '-fms-extens
 $shared = @("$root\src\cJSON.c", "$root\src\ipc.c", '-luser32', '-ladvapi32')
 & $Zig @flags "$root\src\main.c" @shared "$root\dep\curl-8.20\lib\libcurl.lib" '-o' "$out\AgentCore.exe"
 if ($LASTEXITCODE) { throw 'AgentCore compilation failed' }
-& $Zig @flags "$root\src\desktop.c" @shared '-lgdi32' '-lshell32' '-lole32' '-lcomctl32' '-Wl,--subsystem,windows' '-o' "$out\XP-Harness-Desktop.exe"
+& $Zig @flags "$root\src\desktop.c" @shared '-lgdi32' '-lshell32' '-lole32' '-lcomctl32' '-lcomdlg32' '-Wl,--subsystem,windows' '-o' "$out\XP-Harness-Desktop.exe"
 if ($LASTEXITCODE) { throw 'Desktop compilation failed' }
 & $Zig @flags "$root\tests\native_tests.c" @shared "$root\dep\curl-8.20\lib\libcurl.lib" '-o' "$out\native_tests.exe"
 if ($LASTEXITCODE) { throw 'Native test compilation failed' }
+& $Zig @flags "$root\tests\desktop_tests.c" @shared '-lgdi32' '-lshell32' '-lole32' '-lcomctl32' '-lcomdlg32' '-o' "$out\desktop_tests.exe"
+if ($LASTEXITCODE) { throw 'Desktop test compilation failed' }
 Copy-Item -LiteralPath "$root\dep\curl-8.20\bin\libcurl-4.dll", "$root\curl-ca-bundle.crt", "$root\vc6ai.sample.ini" -Destination $out -Force
 Write-Output "Host test build: $out (not an XP-certified release)"
 & "$out\native_tests.exe"
 if ($LASTEXITCODE) { throw 'Native regression tests failed' }
+& "$out\desktop_tests.exe"
+if ($LASTEXITCODE) { throw 'Desktop regression tests failed' }

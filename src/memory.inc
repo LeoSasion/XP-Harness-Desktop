@@ -437,6 +437,64 @@ static int mem_create_chat(const char *project, const char *title, struct config
     if (!mem_catalog_fits()) { cJSON_DeleteItemFromArray(sessions, cJSON_GetArraySize(sessions) - 1); return 0; }
     return mem_open(id, config, convo, 1);
 }
+static int mem_delete_chat(const char *id, struct config_t *config, struct conversation_t *convo) {
+    cJSON *target = mem_find("sessions", id), *next = NULL, *item, *parent;
+    cJSON *sessions = cJSON_GetObjectItemCaseSensitive(memory.root, "sessions");
+    char next_id[80], path[MAX_PATH];
+    int active = target && !strcmp(id, mem_string(memory.root, "active"));
+    if (!target) return mem_fail("Session does not exist.");
+    if (active) {
+        cJSON_ArrayForEach(item, sessions) if (item != target) {
+            if (!mem_path(mem_string(mem_find("projects", mem_string(item, "project")), "path"), path, NULL)) continue;
+            if (!next) next = item;
+            if (!strcmp(mem_string(item, "project"), mem_string(target, "project"))) { next = item; break; }
+        }
+        if (!next) {
+            parent = mem_find("projects", mem_string(target, "project"));
+            if (!mem_path(mem_string(parent, "path"), path, NULL)) parent = cJSON_GetArrayItem(cJSON_GetObjectItemCaseSensitive(memory.root, "projects"), 0);
+            if (!mem_path(mem_string(parent, "path"), path, NULL)) return 0;
+            next = mem_new_session(mem_string(parent, "id"), "New chat");
+        }
+        if (!next) return mem_fail("Cannot create a replacement session.");
+        lstrcpynA(next_id, mem_string(next, "id"), sizeof(next_id));
+        if (!mem_set(memory.root, "active", next_id)) return 0;
+        memory.session = NULL;
+    }
+    cJSON_Delete(cJSON_DetachItemViaPointer(sessions, target));
+    if (!mem_save()) return 0;
+    if (active) return mem_open(next_id, config, convo, 1);
+    mem_catalog(); return 1;
+}
+static int mem_export_chat(const char *id, const char *path) {
+    cJSON *session = mem_find("sessions", id);
+    WCHAR target[MAX_PATH], wide[MAX_PATH], folder[MAX_PATH], temporary[MAX_PATH], *leaf;
+    char *json;
+    HANDLE file;
+    DWORD length, written;
+    int ok;
+    size_t data_prefix = wcsrchr(memory.file, L'\\') - memory.file + 1;
+    if (!session) return mem_fail("Session does not exist.");
+    if (!path || !*path || !MultiByteToWideChar(CP_UTF8, 0, path, -1, wide, MAX_PATH))
+        return mem_fail("Export path is invalid or exceeds MAX_PATH.");
+    length = GetFullPathNameW(wide, MAX_PATH, target, &leaf);
+    if (!length || length >= MAX_PATH || !leaf || !*leaf || !_wcsnicmp(target, memory.file, data_prefix))
+        return mem_fail("Choose an export file outside the application's data folder.");
+    lstrcpynW(folder, target, (int)(leaf - target) + 1);
+    json = cJSON_Print(session);
+    if (!json) return mem_fail("Not enough memory to export this session.");
+    if (!GetTempFileNameW(folder, L"xph", 0, temporary)) { free(json); return mem_fail("Cannot create export file. Check folder permissions."); }
+    file = CreateFileW(temporary, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    ok = file != INVALID_HANDLE_VALUE;
+    if (ok) {
+        length = (DWORD)strlen(json);
+        ok = WriteFile(file, json, length, &written, NULL) && written == length && FlushFileBuffers(file);
+        CloseHandle(file);
+        if (ok) ok = MoveFileExW(temporary, target, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH);
+    }
+    free(json);
+    if (!ok) { DeleteFileW(temporary); return mem_fail("Cannot save export. Check the path and permissions; the destination was not replaced."); }
+    agent_emit("status", "Session exported as UTF-8 JSON with full messages and tool results."); return 1;
+}
 static int mem_change(const char *id, const char *text, int note) {
     cJSON *object;
     const char *key;

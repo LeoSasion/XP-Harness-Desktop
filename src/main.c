@@ -3,6 +3,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <wchar.h>
 #include <stdarg.h>
 #include <ctype.h>
 #include <windows.h>
@@ -873,6 +874,39 @@ static int llm_configured(const struct config_t *config) {
         (!strncmp(config->api_url, "https://", 8) || !strncmp(config->api_url, "http://", 7));
 }
 
+static const char *llm_error_hint(CURLcode result, long status) {
+    if (status == 401) return "Authentication failed. Check ApiKey in Settings (vc6ai.ini).";
+    if (status == 403) return "Access denied. Check API key and model permissions in Settings.";
+    if (status == 429) return "Rate limit or quota reached. Check provider limits; wait before sending Continue.";
+    if (status == 404 || status == 405 || (status >= 300 && status < 400))
+        return "Wrong API endpoint. Set ApiUrl to the final Chat Completions URL in Settings.";
+    if (status >= 500) return "Provider unavailable. Try Continue later; tools are not automatically replayed.";
+    if (status >= 400) return "Request rejected. Check Model, ExtraBody and context size in Settings.";
+    if (result == CURLE_COULDNT_RESOLVE_HOST || result == CURLE_COULDNT_RESOLVE_PROXY)
+        return "DNS lookup failed. Check the API hostname, proxy and network connection.";
+    if (result == CURLE_COULDNT_CONNECT) return "Connection failed. Check ApiUrl, network/proxy and whether the server is running.";
+    if (result == CURLE_OPERATION_TIMEDOUT) return "Request timed out. Check the connection; send Continue when ready.";
+    if (result == CURLE_PEER_FAILED_VERIFICATION || result == CURLE_SSL_CONNECT_ERROR)
+        return "TLS/certificate failure. Check the system clock, CA bundle and endpoint; keep certificate verification enabled.";
+    if (result == CURLE_PARTIAL_FILE || result == CURLE_RECV_ERROR || result == CURLE_GOT_NOTHING)
+        return "Response interrupted. Check the connection; send Continue when ready.";
+    if (result == CURLE_WRITE_ERROR) return "Invalid or oversized response. Check the API endpoint and model; incomplete tool calls were not executed.";
+    return "Check the API settings and connection before trying again.";
+}
+static CURLcode llm_finish(struct http_context_t *http, CURLcode result) {
+    long status = 0;
+    char error[512];
+    if (result == CURLE_ABORTED_BY_CALLBACK && term_interrupted()) return result;
+    curl_easy_getinfo(http->curl, CURLINFO_RESPONSE_CODE, &status);
+    if (status >= 300) result = CURLE_HTTP_RETURNED_ERROR;
+    if (result == CURLE_OK) return result;
+    if (status >= 300) sprintf(error, "HTTP %ld: %s", status, llm_error_hint(result, status));
+    else _snprintf(error, sizeof(error), "%s: %s", curl_easy_strerror(result), llm_error_hint(result, 0));
+    error[sizeof(error) - 1] = 0;
+    fprintf(stderr, "%s\n", error); agent_emit("error", error);
+    return result;
+}
+
 #include "stream.inc"
 
 CURLcode llm_request(struct http_context_t *ctx, struct conversation_t *convo) {
@@ -898,12 +932,7 @@ CURLcode llm_request(struct http_context_t *ctx, struct conversation_t *convo) {
     res = curl_easy_perform(ctx->curl);
     free(payload);
 
-    if (res != CURLE_OK && res != CURLE_ABORTED_BY_CALLBACK) {
-        fprintf(stderr, "curl_easy_perform() failed: %s\n", curl_easy_strerror(res));
-        agent_emit("error", curl_easy_strerror(res));
-    }
-
-    return res;
+    return llm_finish(ctx, res);
 }
 
 //////////////////////////////////////////////////////////////////////////

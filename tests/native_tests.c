@@ -192,6 +192,21 @@ static int pipe_pair(HANDLE *server, HANDLE *client)
     return 1;
 }
 
+static void test_actionable_error_hints(void)
+{
+    CHECK(strstr(llm_error_hint(CURLE_OK, 401), "ApiKey") != NULL);
+    CHECK(strstr(llm_error_hint(CURLE_OK, 403), "permissions") != NULL);
+    CHECK(strstr(llm_error_hint(CURLE_OK, 429), "quota") != NULL);
+    CHECK(strstr(llm_error_hint(CURLE_OK, 404), "Chat Completions") != NULL);
+    CHECK(strstr(llm_error_hint(CURLE_OK, 302), "final") != NULL);
+    CHECK(strstr(llm_error_hint(CURLE_OK, 503), "Provider unavailable") != NULL);
+    CHECK(strstr(llm_error_hint(CURLE_OPERATION_TIMEDOUT, 0), "timed out") != NULL);
+    CHECK(strstr(llm_error_hint(CURLE_COULDNT_CONNECT, 0), "server is running") != NULL);
+    CHECK(strstr(llm_error_hint(CURLE_COULDNT_RESOLVE_HOST, 0), "DNS") != NULL);
+    CHECK(strstr(llm_error_hint(CURLE_PEER_FAILED_VERIFICATION, 0), "verification enabled") != NULL);
+    CHECK(strstr(llm_error_hint(CURLE_PARTIAL_FILE, 200), "interrupted") != NULL);
+}
+
 static int raw_write(HANDLE pipe, const unsigned char *bytes, DWORD size)
 {
     OVERLAPPED ov;
@@ -285,6 +300,7 @@ int main(void)
     test_invalid_tool_dispatch();
     test_execution_journal_validation();
     test_duplicate_tool_ids_rejected();
+    test_actionable_error_hints();
     test_ipc_round_trip_and_cancel();
     test_ipc_rejects_bad_frames();
     term_reset();

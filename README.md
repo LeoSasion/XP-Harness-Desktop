@@ -18,7 +18,7 @@ Win32 原生控件  ← JSON →  原 VC6AI Agent 循环
 - 纯 Win32 项目/会话树、Unicode 输入与回复、嵌入式流式过程输出。
 - 独立 AgentCore，后台请求不会阻塞窗口。
 - 创建项目、创建会话、重命名、切换会话、编辑项目记忆；Ctrl+Enter 发送。
-- 会话和项目笔记本地持久化，重启可恢复；Stop 中断当前任务并保留已完成历史。
+- 会话和项目笔记本地持久化；命令逐次确认，Stop 和崩溃后保留已记录的工具结果。
 - 配置沿用 `vc6ai.ini`，用系统记事本编辑。
 - `AgentCore.exe` 不带参数仍可单独使用命令行模式。
 
@@ -30,9 +30,21 @@ Win32 原生控件  ← JSON →  原 VC6AI Agent 循环
 
 **Memory** 编辑当前项目共享的长期笔记，例如目标、约定和用户主动保存的结论。笔记在同一项目的各会话中使用，其他项目看不到。它是用户明确维护的记忆，程序不会把临时回答自动当作事实保存。
 
-桌面数据保存在程序目录的 `data/library.json`，包含项目、会话原始消息、公开思考文本及工具过程。写入采用同目录临时文件、刷新和原子替换；数据目录已被 Git 忽略。一个数据目录只允许一个 Core 写入，损坏的数据不会被自动重置。退出或 Stop 后，下次启动恢复已完成的对话；Core 已接收的中断轮次保留过程标记，未完成的工具调用不会作为有效模型历史回放。整库最多 32 MiB、每会话过程记录最多 4 MiB，达到限制会明确报错，不会自动删除旧历史。
+桌面数据保存在程序目录的 `data/library.json`，包含项目、会话原始消息、公开思考文本及工具过程。写入采用同目录临时文件、刷新和原子替换；数据目录已被 Git 忽略。一个数据目录只允许一个 Core 写入，损坏的数据不会被自动重置。工具结果与显示记录在同一次检查点保存，再通知桌面。中断轮次保留用户目标、完整工具调用及已记录结果；缺失结果会补上明确的未执行或结果不明标记，维持工具调用与结果配对。整库最多 32 MiB、每会话显示记录最多 4 MiB；普通聊天达到限制会明确报错。工具结果和中断恢复仍能保存：必要时缩短显示记录并标明截取，原始消息和完整工具结果不删减。
 
 发送给模型的是有界上下文：项目系统提示、项目笔记、旧轮次摘录和最近完整轮次。`ContextBytes=65536` 默认限制消息 JSON 的 UTF-8 字节数，可配置为 16384–262144。工具调用和结果按完整轮次保留，旧工具输出可在模型输入中截短，磁盘原始记录不受影响。旧轮次摘录不是语义总结，也不是无限记忆；不会为此额外调用云模型。当前完整轮次无法放入预算时会明确报错。
+
+## XP 环境、工具确认与恢复
+
+系统提示固定以 **Windows XP SP3 x86** 为兼容目标，在现代 Windows 开发机上也不放宽要求。环境信息包含 Windows API 报告的系统版本、实际 cmd.exe 路径、工作目录和 ANSI/OEM 代码页。只列出程序目录中检测到的 BusyBox、jq、curl 的绝对路径；检测仅检查文件存在，不验证版本。不假定 PowerShell、Python、winget、WSL 或现代命令可用，工具缺失时要求模型说明限制。
+
+桌面每次执行有效 `cmd` 调用前显示原生 **Tool permission** 窗口：完整工作目录、命令和 stdin 可滚动查看，提供 **Allow once**、**Deny**、**Stop task**。默认焦点为 Deny，关闭窗口也拒绝。许可只对应本次唯一标识；拒绝、错误/过期标识和非布尔允许值都不会执行命令。命令最多 4000 字节，桌面 stdin 最多 128 KiB；整个确认事件仍受 256 KiB 管道帧上限限制，超限不执行。
+
+当前/最近一轮的 `turn` 检查点与工具状态保存在原 JSON 库内，已有 v1 库可直接读取。命令启动前必须成功保存 `running`，命令结束后立即保存结果，再请求模型；后续 API 失败不会抹掉这些结果。保存失败时停止后续执行，保留磁盘上的上一次成功检查点。重启只恢复本地记录，不自动请求模型或重放命令；在原会话发送“继续”可带着这些记录继续对话，每个新命令仍须重新确认。
+
+Stop 通过 Win32 Event 通知 Core，取消 HTTP、终止当前命令及 Job Object 中的子进程，保存状态；5 秒仍未完成时强制结束本窗口拥有的 Core。stdin 写入与输出读取并行，避免满管道阻塞停止。崩溃时处于 `running` 且没有持久结果的调用标记为 **UNKNOWN**，提示用户核查影响；等待确认的调用标记为未执行。恢复不会撤销已经发生的文件修改，也不保证任意命令恰好执行一次。
+
+这些确认和持久恢复功能用于桌面/管道模式；独立 CLI 保持上游自动执行方式，不使用桌面审批和项目库。
 
 ## 构建与运行
 
@@ -78,7 +90,7 @@ ExtraBody={"thinking":{"type":"enabled"},"reasoning_effort":"high"}
 ### 当前 Agent 能力
 
 - 多轮对话与多轮工具调用：支持。每次提问最多 24 次模型请求，每个响应最多 16 个工具调用；当前仅有 `cmd` 工具，按顺序执行，结果回传模型。
-- 深度思考展示：桌面与命令行支持流式 `reasoning_content`（也接受文本 `reasoning`），回答和工具参数的碎片会正确拼接。缺失完成标记、中断或错误的响应不会执行其中的工具，失败轮次不会进入有效模型历史。桌面右侧依次显示思考、回答、工具命令、stdin、结果和退出码。
+- 深度思考展示：桌面与命令行支持流式 `reasoning_content`（也接受文本 `reasoning`），回答和工具参数的碎片会正确拼接。缺失完成标记、中断或错误的响应不会执行其中的工具；桌面保留此前已完整接收的工具调用、公开思考与执行结果，部分流式回答仅作为过程记录保存。桌面右侧依次显示思考、回答、工具命令、stdin、结果和退出码。
 - MCP：未实现，没有 MCP 协议客户端、服务器配置或工具发现。
 
 上游附带的 libcurl 使用 OpenSSL；这里保留证书验证与 CA 文件，不改用 Windows 系统 TLS。实际联网能力仍需在目标 XP 机器验证。不要仅凭 `_WIN32_WINNT` 或 PE 子系统版本判断兼容性。
@@ -93,11 +105,14 @@ ExtraBody={"thinking":{"type":"enabled"},"reasoning_effort":"high"}
 | `src/agent_mode.inc` | 桌面模式入口，复用同一份 Agent 实现 |
 | `src/stream.inc` | 桌面/CLI 共用 SSE 增量解析、思考/回答输出和工具参数拼接 |
 | `src/memory.inc` | 本地项目/会话库、原子保存与上下文投影 |
+| `src/recovery.inc` | 当前轮次检查点、执行状态校验与中断结果补齐 |
 | `src/desktop.c` | 原生项目树、聊天与记忆编辑、后台通信线程 |
 | `src/ipc.c` / `src/ipc.h` | 长度前缀、256 KiB 上限、可取消 I/O、当前登录会话 ACL |
 | `src/cJSON.*` / `dep/` | 上游依赖 |
 
 IPC 为 4 字节小端长度加 UTF-8 JSON，单连接、请求顺序执行。`library` 列出项目/会话，`open` 恢复会话；`new_project`、`new_chat`、`rename`、`memory` 管理本地数据。`chat` 带会话 `id`、`text` 和 `stream:true`；旧客户端不带 `stream` 时仍用完整 JSON。过程事件包含 `reasoning_delta`、`answer_delta`、`tool`、`tool_stdin`、`tool_result`、`context`、`error`，每个请求以 `done` 结束。`reset` 与 `shutdown` 保留兼容。这是内部 MVP 协议，不引入通用 RPC 或插件协议。
+
+新增 `permission` 事件，`text` 为 JSON 对象，包含 `id`（一次性申请标识）、`tool_call_id`、`name`、`cwd`、`command`、`stdin`。客户端仅在收到申请后回复 `{"type":"permission","id":"申请标识","allow":true}` 或 `allow:false`。老管道客户端需要处理这个事件；10 分钟无回复按中断处理。桌面将一个匿名取消 Event 的句柄通过 `--cancel` 参数交给 Core，Core 从指定父进程复制仅等待权限的句柄。
 
 ## 验证
 
@@ -108,6 +123,7 @@ IPC 为 4 字节小端长度加 UTF-8 JSON，单连接、请求顺序执行。`l
 python tests\smoke.py build\host\AgentCore.exe
 python tests\stream_smoke.py build\host\AgentCore.exe
 python tests\desktop_memory_smoke.py build\host\AgentCore.exe
+python tests\approval_recovery_smoke.py build\host\AgentCore.exe
 ```
 
 这些测试不需要真实 API Key、不请求云端模型。原生测试覆盖响应校验与 IPC；smoke 测试检查自定义地址、可选认证、两轮无害 `echo` 工具调用与后续历史；stream_smoke 检查实时输出、碎片化 SSE 与错误恢复；desktop_memory_smoke 检查项目/会话与笔记隔离、工作目录、重启和 Stop 恢复、上下文预算、完整历史、长回复跨帧恢复、库锁与损坏/保存失败保护。`build\host` 是开发验证产物，不是经过认证的 XP 发布包。

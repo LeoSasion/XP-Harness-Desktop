@@ -19,6 +19,9 @@ k = C.WinDLL('kernel32', use_last_error=True)
 k.CreateFileW.argtypes = [W.LPCWSTR, W.DWORD, W.DWORD, W.LPVOID, W.DWORD, W.DWORD, W.HANDLE]
 k.CreateFileW.restype = W.HANDLE
 k.CloseHandle.argtypes = [W.HANDLE]
+k.CreateEventW.argtypes = [W.LPVOID, W.BOOL, W.BOOL, W.LPCWSTR]
+k.CreateEventW.restype = W.HANDLE
+k.SetEvent.argtypes = [W.HANDLE]
 k.ReadFile.argtypes = [W.HANDLE, W.LPVOID, W.DWORD, C.POINTER(W.DWORD), W.LPVOID]
 k.WriteFile.argtypes = k.ReadFile.argtypes
 k.PeekNamedPipe.argtypes = [W.HANDLE, W.LPVOID, W.DWORD, W.LPVOID, C.POINTER(W.DWORD), W.LPVOID]
@@ -28,8 +31,10 @@ INVALID = C.c_void_p(-1).value
 class Core:
     def __init__(self, directory):
         self.name = rf'\\.\pipe\vc6agent-{os.getpid()}-{time.monotonic_ns()}'
+        self.cancel = k.CreateEventW(None, True, False, None)
+        assert self.cancel
         self.process = subprocess.Popen([str(directory / 'AgentCore.exe'), '--pipe', self.name,
-                                         '--parent', str(os.getpid())], cwd=directory,
+                                         '--parent', str(os.getpid()), '--cancel', str(self.cancel)], cwd=directory,
                                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         self.handle = INVALID
         deadline = time.monotonic() + 5
@@ -83,6 +88,11 @@ class Core:
         while True:
             event = self.read()
             events.append(event)
+            if event.get('type') == 'permission':
+                # This offline test driver approves only its own fixture commands.
+                permission = json.loads(event['text'])
+                assert permission['command'].startswith('echo '), permission
+                self.send({'type': 'permission', 'id': permission['id'], 'allow': True})
             if event.get('type') == 'done':
                 return events
 
@@ -95,6 +105,9 @@ class Core:
         except subprocess.TimeoutExpired:
             self.process.kill()
             self.process.wait()
+        if self.cancel:
+            k.CloseHandle(self.cancel)
+            self.cancel = None
 
 
 def check_custom_api(directory):

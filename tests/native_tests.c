@@ -133,6 +133,46 @@ static void test_invalid_tool_dispatch(void)
     }
 }
 
+static void test_execution_journal_validation(void)
+{
+    cJSON *turn, *entry;
+    CHECK(mem_turn_valid(NULL)); /* Existing v1 libraries remain readable. */
+    turn = cJSON_Parse("{\"messages\":[{\"role\":\"user\",\"content\":\"task\"},{\"role\":\"assistant\",\"tool_calls\":[{\"id\":\"call\",\"function\":{\"name\":\"cmd\",\"arguments\":\"{}\"}}]}],\"tools\":[{\"id\":\"call\",\"request\":\"approval\",\"index\":1,\"state\":\"running\"}]}");
+    CHECK(turn != NULL);
+    CHECK(mem_turn_valid(turn));
+    entry = cJSON_GetArrayItem(cJSON_GetObjectItemCaseSensitive(turn, "tools"), 0);
+    mem_set(entry, "state", "completed");
+    CHECK(!mem_turn_valid(turn)); /* A finished execution requires its result. */
+    mem_set(entry, "result", "[exit 0]");
+    CHECK(mem_turn_valid(turn));
+    mem_set(entry, "state", "invalid-state");
+    CHECK(!mem_turn_valid(turn));
+    mem_set(entry, "state", "unknown");
+    CHECK(mem_turn_valid(turn));
+    mem_set(entry, "id", "another-call");
+    CHECK(!mem_turn_valid(turn));
+    mem_set(entry, "id", "call");
+    cJSON_ReplaceItemInObjectCaseSensitive(entry, "index", cJSON_CreateNumber(1.5));
+    CHECK(!mem_turn_valid(turn));
+    cJSON_ReplaceItemInObjectCaseSensitive(entry, "index", cJSON_CreateNumber(0));
+    CHECK(!mem_turn_valid(turn));
+    cJSON_Delete(turn);
+    turn = cJSON_Parse("{\"messages\":[],\"tools\":{}}");
+    CHECK(!mem_turn_valid(turn));
+    cJSON_Delete(turn);
+}
+
+static void test_duplicate_tool_ids_rejected(void)
+{
+    struct conversation_t convo;
+    const char *response = "{\"choices\":[{\"finish_reason\":\"tool_calls\",\"message\":{\"role\":\"assistant\",\"tool_calls\":[{\"id\":\"duplicate\",\"function\":{\"name\":\"cmd\",\"arguments\":\"{}\"}},{\"id\":\"duplicate\",\"function\":{\"name\":\"cmd\",\"arguments\":\"{}\"}}]}}]}";
+    fixture(&convo);
+    CHECK(convo_add_response(&convo, response) == -1);
+    CHECK(convo.pending_tool_msg == NULL);
+    CHECK(cJSON_GetArraySize(convo.messages) == 1);
+    convo_cleanup(&convo);
+}
+
 static int pipe_pair(HANDLE *server, HANDLE *client)
 {
     static unsigned int serial;
@@ -243,6 +283,8 @@ int main(void)
     test_malformed_responses();
     test_tool_response_is_preserved_without_execution();
     test_invalid_tool_dispatch();
+    test_execution_journal_validation();
+    test_duplicate_tool_ids_rejected();
     test_ipc_round_trip_and_cancel();
     test_ipc_rejects_bad_frames();
     term_reset();

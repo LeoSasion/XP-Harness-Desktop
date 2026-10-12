@@ -90,10 +90,11 @@ class Provider:
                     finish = 'stop'
                     if response['tool']:
                         finish = 'tool_calls'
+                        commands = [dict(id='call_echo', command='echo cwd=%CD%', stdin='safe input\n')] if response['tool'] is True else response['tool']
                         message.update(content=None, tool_calls=[{
-                            'id': 'call_echo', 'type': 'function', 'function': {
-                                'name': 'cmd', 'arguments': json.dumps({
-                                    'command': 'echo cwd=%CD%', 'stdin': 'safe input\n'})}}])
+                            'id': command.get('id', 'call_%d' % i), 'type': 'function', 'function': {
+                                'name': 'cmd', 'arguments': json.dumps({key: value for key, value in command.items() if key != 'id'})}}
+                            for i, command in enumerate(commands)])
                     if body.get('stream'):
                         self.send_response(200)
                         self.send_header('Content-Type', 'text/event-stream')
@@ -109,7 +110,8 @@ class Provider:
                             assert response['gate'].wait(10), 'Test did not release streaming gate'
                         if response['tool']:
                             calls = message['tool_calls']
-                            calls[0]['index'] = 0
+                            for i, call in enumerate(calls):
+                                call['index'] = i
                             chunk({'tool_calls': calls})
                         else:
                             half = max(1, len(response['answer']) // 2)
@@ -124,7 +126,7 @@ class Provider:
                         self.send_header('Content-Length', str(len(data)))
                         self.end_headers()
                         self.wfile.write(data)
-                except (BrokenPipeError, ConnectionResetError):
+                except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
                     pass  # Expected when the owned core is stopped mid-stream.
                 except Exception as exc:
                     owner.failures.append(repr(exc))
@@ -257,7 +259,9 @@ def check_library_and_stream(source, directory, provider):
         provider.queue(plan(tool=True), plan(status=500))
         events = core.turn({'type': 'chat', 'id': first_id, 'text': 'failed turn', 'stream': True})
         assert any(e['type'] == 'error' for e in events), events
-        assert session_data(directory, first_id)['messages'] == before_failure, 'Failed tool turn leaked into persisted history'
+        failed_history = session_data(directory, first_id)['messages']
+        assert failed_history[:len(before_failure)] == before_failure
+        assert any(m['role'] == 'tool' and 'cwd=' in m['content'] for m in failed_history[len(before_failure):]), 'Executed tool result was lost'
         tool_pairs(session_data(directory, first_id)['messages'])
 
         # A second process may connect long enough to report the lock error, but
@@ -285,6 +289,9 @@ def check_library_and_stream(source, directory, provider):
         try:
             while True:
                 event = core.read()
+                if event['type'] == 'permission':
+                    permission = json.loads(event['text'])
+                    core.send({'type': 'permission', 'id': permission['id'], 'allow': True})
                 assert event['type'] != 'done', event
                 if event['type'] == 'tool_result':
                     saw_tool_result = True
@@ -300,8 +307,9 @@ def check_library_and_stream(source, directory, provider):
         assert resumed['title'] == 'Alpha renamed' and resumed['memory'] == notes
         assert 'ALPHA_PRIVATE_REPLY' in replay and 'tool completed' in replay, replay
         recovered = session_data(directory, first_id)['messages']
-        assert recovered == before_failure, 'Stop failed to recover the last completed messages'
-        assert 'STOP_UNCOMMITTED_TURN' not in json.dumps(recovered)
+        assert recovered[:len(failed_history)] == failed_history, 'Recovery changed prior history'
+        assert 'STOP_UNCOMMITTED_TURN' in json.dumps(recovered)
+        assert any(m['role'] == 'tool' for m in recovered[len(failed_history):]), 'Stop discarded executed tool results'
         tool_pairs(recovered)
 
         # Exceed the context budget while retaining complete raw history on disk.
@@ -406,7 +414,7 @@ def main():
     finally:
         provider.close()
     print('desktop_memory_smoke: project/session isolation, memory, streaming, tool cwd, '
-          'restart/Stop recovery, failure rollback, context budget, raw history, '
+          'restart/Stop recovery, retained failed-tool history, context budget, raw history, '
           'lock/corruption and atomic-save failure checks passed')
 
 

@@ -10,6 +10,7 @@
 #include <wincrypt.h>
 #include <process.h>
 #include <stdlib.h>
+#include <stdio.h>
 #include <string.h>
 #include <wchar.h>
 #include "cJSON.h"
@@ -37,12 +38,15 @@ typedef struct {
     const WCHAR *label, *initial;
     HWND edit;
     WCHAR *result;
-    int multiline, limit, done;
+    int multiline, limit, done, approval, decision;
 } PROMPT;
 static HWND window, transcript, input, send_button, new_button, stop_button, tree;
 static HWND settings_button, project_button, rename_button, memory_button;
 static HWND status_label, input_label, title_label, path_label, context_label, tree_label;
 static HANDLE quit_event, cancel_event, work_event, worker;
+static HANDLE core_cancel, force_event, permission_event;
+static HWND permission_window;
+static char *permission_reply;
 static HANDLE core_process, pipe_handle = INVALID_HANDLE_VALUE;
 static WCHAR directory[MAX_PATH], last_character;
 static char *pending_request, *active_id, *selected_id;
@@ -51,6 +55,7 @@ static cJSON *catalog, *session;
 static LONG serial, pending_serial;
 static int busy, stopping, closing, rebuilding, bootstrap, request_failed;
 static int reload_settings, pending_reload, request_is_chat;
+static void show_permission(const char *text);
 
 static const char *string_value(const cJSON *object, const char *key) {
     cJSON *value = cJSON_GetObjectItemCaseSensitive(object, key);
@@ -117,7 +122,8 @@ static int start_core(void) {
     if (!error) return 0;
     wsprintfW(name, L"\\\\.\\pipe\\vc6agent-%lu-%08lx%08lx", GetCurrentProcessId(), random[0], random[1]);
     wsprintfW(executable, L"%s\\AgentCore.exe", directory);
-    wsprintfW(command, L"\"%s\" --pipe %s --parent %lu", executable, name, GetCurrentProcessId());
+    ResetEvent(core_cancel); ResetEvent(force_event);
+    wsprintfW(command, L"\"%s\" --pipe %s --parent %lu --cancel %lu", executable, name, GetCurrentProcessId(), (DWORD)(ULONG_PTR)core_cancel);
     ZeroMemory(&startup, sizeof(startup)); startup.cb = sizeof(startup);
     ZeroMemory(&process, sizeof(process));
     if (!CreateProcessW(executable, command, NULL, NULL, FALSE, CREATE_NO_WINDOW,
@@ -137,7 +143,7 @@ static int start_core(void) {
 }
 
 static unsigned __stdcall worker_main(void *unused) {
-    HANDLE events[3];
+    HANDLE events[3], permission_waits[3];
     DWORD wait;
     LONG id;
     char *request, *reply;
@@ -146,6 +152,7 @@ static unsigned __stdcall worker_main(void *unused) {
     int ok, finished;
     (void)unused;
     events[0] = quit_event; events[1] = cancel_event; events[2] = work_event;
+    permission_waits[0] = quit_event; permission_waits[1] = cancel_event; permission_waits[2] = permission_event;
     for (;;) {
         wait = WaitForMultipleObjects(3, events, FALSE, INFINITE);
         if (wait == WAIT_OBJECT_0 || wait == WAIT_FAILED) break;
@@ -157,16 +164,24 @@ static unsigned __stdcall worker_main(void *unused) {
         request = pending_request; pending_request = NULL; id = pending_serial;
         if (!request) continue;
         if (pending_reload) stop_core();
-        ok = start_core() && ipc_write(pipe_handle, request, cancel_event, 10000);
+        ok = start_core() && ipc_write(pipe_handle, request, force_event, 10000);
         free(request); finished = 0;
         while (ok && !finished) {
             reply = NULL;
-            ok = ipc_read(pipe_handle, &reply, cancel_event, 600000);
+            ok = ipc_read(pipe_handle, &reply, force_event, 600000);
             if (!ok) { free(reply); break; }
             message = cJSON_Parse(reply); type = string_value(message, "type");
             if (!*type) ok = 0;
             else if (!strcmp(type, "done")) finished = 1;
-            else post_event(EV_PROTOCOL, id, reply);
+            else if (!strcmp(type, "permission")) {
+                free(permission_reply); permission_reply = NULL; ResetEvent(permission_event);
+                post_event(EV_PROTOCOL, id, reply);
+                wait = WaitForMultipleObjects(3, permission_waits, FALSE, 600000);
+                if (wait == WAIT_OBJECT_0 + 2 && permission_reply)
+                    ok = ipc_write(pipe_handle, permission_reply, force_event, 10000);
+                else if (wait != WAIT_OBJECT_0 && wait != WAIT_OBJECT_0 + 1) ok = 0;
+                free(permission_reply); permission_reply = NULL;
+            } else post_event(EV_PROTOCOL, id, reply);
             cJSON_Delete(message); free(reply);
         }
         if (WaitForSingleObject(cancel_event, 0) == WAIT_OBJECT_0) {
@@ -310,7 +325,8 @@ static void protocol_event(const char *json) {
     cJSON *message = cJSON_Parse(json), *next, *context;
     const char *type = string_value(message, "type"), *text = string_value(message, "text");
     WCHAR info[120];
-    if (!strcmp(type, "catalog")) show_catalog(text);
+    if (!strcmp(type, "permission")) show_permission(text);
+    else if (!strcmp(type, "catalog")) show_catalog(text);
     else if (!strcmp(type, "session")) {
         next = cJSON_Parse(text);
         if (cJSON_IsObject(next)) {
@@ -355,18 +371,25 @@ static LRESULT CALLBACK prompt_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         prompt = (PROMPT *)((CREATESTRUCTW *)lp)->lpCreateParams;
         SetWindowLongW(hwnd, GWL_USERDATA, (LONG)prompt);
         control(hwnd, L"STATIC", prompt->label, 0, 10);
-        prompt->edit = control(hwnd, L"EDIT", prompt->initial, WS_TABSTOP | ES_AUTOVSCROLL |
+        prompt->edit = control(hwnd, L"EDIT", prompt->initial, WS_TABSTOP | ES_AUTOVSCROLL | (prompt->approval ? ES_READONLY : 0) |
             (prompt->multiline ? ES_MULTILINE | ES_WANTRETURN | WS_VSCROLL : ES_AUTOHSCROLL), 11);
-        control(hwnd, L"BUTTON", L"&Save", WS_TABSTOP | BS_DEFPUSHBUTTON, IDOK);
-        control(hwnd, L"BUTTON", L"Cancel", WS_TABSTOP, IDCANCEL);
+        control(hwnd, L"BUTTON", prompt->approval ? L"&Allow once" : L"&Save", WS_TABSTOP | (prompt->approval ? 0 : BS_DEFPUSHBUTTON), IDOK);
+        control(hwnd, L"BUTTON", prompt->approval ? L"&Deny" : L"Cancel", WS_TABSTOP | (prompt->approval ? BS_DEFPUSHBUTTON : 0), IDCANCEL);
+        if (prompt->approval) control(hwnd, L"BUTTON", L"&Stop task", WS_TABSTOP, ID_STOP);
         SendMessageW(prompt->edit, EM_LIMITTEXT, prompt->limit, 0); return 0;
     case WM_SIZE:
         GetClientRect(hwnd, &rect);
         MoveWindow(GetDlgItem(hwnd, 10), 12, 12, rect.right - 24, 36, TRUE);
         MoveWindow(prompt->edit, 12, 50, rect.right - 24, rect.bottom - 102, TRUE);
-        MoveWindow(GetDlgItem(hwnd, IDOK), rect.right - 188, rect.bottom - 38, 80, 26, TRUE);
+        MoveWindow(GetDlgItem(hwnd, IDOK), rect.right - (prompt->approval ? 300 : 188), rect.bottom - 38, prompt->approval ? 100 : 80, 26, TRUE);
+        if (prompt->approval) MoveWindow(GetDlgItem(hwnd, ID_STOP), rect.right - 192, rect.bottom - 38, 88, 26, TRUE);
         MoveWindow(GetDlgItem(hwnd, IDCANCEL), rect.right - 96, rect.bottom - 38, 84, 26, TRUE); return 0;
     case WM_COMMAND:
+        if (prompt->approval && (LOWORD(wp) == IDOK || LOWORD(wp) == IDCANCEL || LOWORD(wp) == ID_STOP)) {
+            prompt->decision = LOWORD(wp) == IDOK;
+            if (LOWORD(wp) == ID_STOP) SendMessageW(window, WM_COMMAND, ID_STOP, 0);
+            DestroyWindow(hwnd); return 0;
+        }
         if (LOWORD(wp) == IDOK) {
             length = GetWindowTextLengthW(prompt->edit); wide = (WCHAR *)malloc((length + 1) * sizeof(WCHAR));
             if (!wide) return 0;
@@ -379,6 +402,13 @@ static LRESULT CALLBACK prompt_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             free(utf8); prompt->result = wide; DestroyWindow(hwnd);
         } else if (LOWORD(wp) == IDCANCEL) DestroyWindow(hwnd);
         return 0;
+    case WM_GETMINMAXINFO:
+        if (prompt && prompt->approval) {
+            ((MINMAXINFO *)lp)->ptMinTrackSize.x = 500;
+            ((MINMAXINFO *)lp)->ptMinTrackSize.y = 300;
+            return 0;
+        }
+        break;
     case WM_CTLCOLORSTATIC:
     case WM_CTLCOLOREDIT:
         child = (HWND)lp; SetTextColor((HDC)wp, GetSysColor(child == prompt->edit ? COLOR_WINDOWTEXT : COLOR_BTNTEXT));
@@ -387,6 +417,43 @@ static LRESULT CALLBACK prompt_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_DESTROY: prompt->done = 1; return 0;
     }
     return DefWindowProcW(hwnd, msg, wp, lp);
+}
+
+static void show_permission(const char *text) {
+    cJSON *request = cJSON_Parse(text), *reply;
+    char *details;
+    WCHAR *wide;
+    PROMPT prompt;
+    MSG msg;
+    RECT owner;
+    size_t size;
+    if (closing || stopping || !busy || !*string_value(request, "id")) { cJSON_Delete(request); return; }
+    size = strlen(text) + 256; details = (char *)malloc(size);
+    if (!details) { cJSON_Delete(request); SendMessageW(window, WM_COMMAND, ID_STOP, 0); return; }
+    _snprintf(details, size, "Working directory:\r\n%s\r\n\r\nCommand (cmd.exe /D /C):\r\n%s\r\n\r\nStandard input (verbatim):\r\n%s",
+        string_value(request, "cwd"), string_value(request, "command"), string_value(request, "stdin"));
+    details[size - 1] = 0; wide = to_wide(details); free(details);
+    ZeroMemory(&prompt, sizeof(prompt)); prompt.approval = prompt.multiline = 1;
+    prompt.limit = IPC_MAX_FRAME; prompt.initial = wide ? wide : L"";
+    prompt.label = L"Allow this command once? Review the full command and input below.";
+    GetWindowRect(window, &owner); EnableWindow(window, FALSE);
+    permission_window = wide ? CreateWindowExW(WS_EX_DLGMODALFRAME | WS_EX_CONTROLPARENT, L"XPHarnessPrompt", L"Tool permission",
+        WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_THICKFRAME, owner.left + 70, owner.top + 70, 680, 470,
+        window, NULL, GetModuleHandleW(NULL), &prompt) : NULL;
+    if (permission_window) {
+        ShowWindow(permission_window, SW_SHOW); SetFocus(GetDlgItem(permission_window, IDCANCEL));
+        while (!prompt.done && GetMessageW(&msg, NULL, 0, 0) > 0)
+            if (!IsDialogMessageW(permission_window, &msg)) { TranslateMessage(&msg); DispatchMessageW(&msg); }
+        if (!prompt.done) { DestroyWindow(permission_window); PostQuitMessage((int)msg.wParam); }
+    }
+    permission_window = NULL; free(wide); EnableWindow(window, TRUE);
+    if (!closing) SetActiveWindow(window);
+    if (!stopping && !closing && busy) {
+        reply = cJSON_CreateObject(); cJSON_AddStringToObject(reply, "type", "permission");
+        cJSON_AddStringToObject(reply, "id", string_value(request, "id")); cJSON_AddBoolToObject(reply, "allow", prompt.decision);
+        permission_reply = cJSON_PrintUnformatted(reply); cJSON_Delete(reply); SetEvent(permission_event);
+    }
+    cJSON_Delete(request);
 }
 
 static WCHAR *edit_text(const WCHAR *title, const WCHAR *label, const WCHAR *initial, int multiline) {
@@ -546,8 +613,9 @@ static LRESULT CALLBACK window_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_COMMAND:
         if (LOWORD(wp) == ID_SEND) send_chat();
         else if (LOWORD(wp) == ID_STOP && busy && request_is_chat && !stopping && !closing) {
-            InterlockedIncrement(&serial); stopping = 1; bootstrap = 0; enable_controls();
-            SetWindowTextW(status_label, L"Cancelling the current task; saved history is retained..."); SetEvent(cancel_event);
+            stopping = 1; bootstrap = 0; enable_controls();
+            SetWindowTextW(status_label, L"Stopping and saving tool outcomes..."); SetEvent(core_cancel); SetEvent(cancel_event);
+            SetTimer(hwnd, 2, 5000, NULL);
         } else if (!busy && !closing) {
             if (LOWORD(wp) == ID_NEW && *selected_project()) {
                 message = request_type("new_chat"); cJSON_AddStringToObject(message, "project", selected_project()); queue_request(message);
@@ -563,6 +631,8 @@ static LRESULT CALLBACK window_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (event->kind == EV_PROTOCOL) protocol_event(event->text);
             else if (event->kind == EV_FAILED) { request_failed = 1; begin_section("Error"); append_utf8(event->text); }
             else {
+                KillTimer(hwnd, 2);
+                if (permission_window) DestroyWindow(permission_window);
                 busy = stopping = 0;
                 if (event->kind == EV_CANCELLED) {
                     begin_section("Interrupted"); append_text(L"Task cancelled. Saved conversation and project memory are retained.");
@@ -583,8 +653,11 @@ static LRESULT CALLBACK window_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_CLOSE:
         if (closing) return 0;
         closing = 1; enable_controls(); SetWindowTextW(status_label, L"Closing AgentCore...");
-        SetEvent(quit_event); SetEvent(cancel_event); SetTimer(hwnd, 1, 30, NULL); return 0;
+        if (permission_window) DestroyWindow(permission_window);
+        SetEvent(core_cancel); SetEvent(quit_event); SetEvent(cancel_event);
+        SetTimer(hwnd, 2, 5000, NULL); SetTimer(hwnd, 1, 30, NULL); return 0;
     case WM_TIMER:
+        if (wp == 2) { KillTimer(hwnd, 2); SetEvent(force_event); }
         if (closing && WaitForSingleObject(worker, 0) == WAIT_OBJECT_0) {
             KillTimer(hwnd, 1);
             while (PeekMessageW(&queued, hwnd, WM_EVENT, WM_EVENT, PM_REMOVE)) free((void *)queued.lParam);
@@ -607,6 +680,8 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE previous, LPSTR command, int sh
     slash = wcsrchr(directory, L'\\'); if (!slash) return 1; *slash = 0;
     quit_event = CreateEventW(NULL, TRUE, FALSE, NULL); cancel_event = CreateEventW(NULL, TRUE, FALSE, NULL);
     work_event = CreateEventW(NULL, FALSE, FALSE, NULL); if (!quit_event || !cancel_event || !work_event) return 1;
+    core_cancel = CreateEventW(NULL, TRUE, FALSE, NULL); force_event = CreateEventW(NULL, TRUE, FALSE, NULL);
+    permission_event = CreateEventW(NULL, TRUE, FALSE, NULL); if (!core_cancel || !force_event || !permission_event) return 1;
     InitCommonControls(); CoInitialize(NULL);
     ZeroMemory(&cls, sizeof(cls)); cls.lpfnWndProc = window_proc; cls.hInstance = instance;
     cls.hCursor = LoadCursor(NULL, IDC_ARROW); cls.hIcon = LoadIcon(NULL, IDI_APPLICATION);
@@ -626,6 +701,7 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE previous, LPSTR command, int sh
         if (!IsDialogMessageW(window, &msg)) { TranslateMessage(&msg); DispatchMessageW(&msg); }
     }
     CloseHandle(worker); CloseHandle(work_event); CloseHandle(cancel_event); CloseHandle(quit_event);
+    CloseHandle(core_cancel); CloseHandle(force_event); CloseHandle(permission_event);
     cJSON_Delete(session); cJSON_Delete(catalog); free(active_id); free(selected_id); CoUninitialize();
     return (int)msg.wParam;
 }

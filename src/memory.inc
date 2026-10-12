@@ -7,7 +7,7 @@ static struct {
     cJSON *root, *session, *project;
     HANDLE lock;
     WCHAR file[MAX_PATH], temporary[MAX_PATH];
-    int failed, context_bytes, recording, reported;
+    int failed, context_bytes, recording, reported, turn_start;
     DWORD flushed;
     size_t dirty;
     char kind[24], error[256];
@@ -84,7 +84,7 @@ static int mem_json_text(const char *text, size_t size) {
     }
     return 1;
 }
-static int mem_messages(cJSON *messages) {
+static int mem_messages_ex(cJSON *messages, int partial) {
     cJSON *message, *calls = NULL, *call, *function;
     const char *role, *id, *ids[16];
     int count = 0, found, i, open_turn = 0;
@@ -103,7 +103,7 @@ static int mem_messages(cJSON *messages) {
                 cJSON_ArrayForEach(call, calls) {
                     function = cJSON_GetObjectItemCaseSensitive(call, "function");
                     id = mem_string(call, "id");
-                    if (!id || !*id || !mem_text(function, "name", 256, 0) ||
+                    if (!mem_text(call, "id", 256, 0) || !mem_text(function, "name", 256, 0) ||
                         !mem_text(function, "arguments", LIBRARY_MAX, 1)) return 0;
                     for (i = 0; i < count; ++i) if (!strcmp(ids[i], id)) return 0;
                     ids[count++] = id;
@@ -120,8 +120,10 @@ static int mem_messages(cJSON *messages) {
             ids[found] = ids[--count];
         } else return 0;
     }
-    return !count && !open_turn;
+    return partial || (!count && !open_turn);
 }
+static int mem_messages(cJSON *messages) { return mem_messages_ex(messages, 0); }
+static int mem_turn_valid(cJSON *turn);
 static int mem_validate(void) {
     cJSON *projects, *sessions, *item, *other, *version, *pending;
     const char *id;
@@ -143,7 +145,8 @@ static int mem_validate(void) {
         if (!mem_text(item, "id", 80, 0) || !mem_text(item, "title", NAME_MAX_BYTES, 0) ||
             !mem_find("projects", mem_string(item, "project")) || !cJSON_IsBool(pending) ||
             !mem_text(item, "transcript", TRANSCRIPT_MAX, 1) ||
-            !mem_messages(cJSON_GetObjectItemCaseSensitive(item, "messages"))) return 0;
+            !mem_messages(cJSON_GetObjectItemCaseSensitive(item, "messages")) ||
+            !mem_turn_valid(cJSON_GetObjectItemCaseSensitive(item, "turn"))) return 0;
         id = mem_string(item, "id");
         if (mem_find("projects", id)) return 0;
         for (other = item->next; other; other = other->next)
@@ -197,6 +200,32 @@ static int mem_append_limit(cJSON *session, const char *prefix, const char *text
 static int mem_append(cJSON *session, const char *prefix, const char *text) {
     return mem_append_limit(session, prefix, text, TRANSCRIPT_MAX - 256);
 }
+/* Recovery and tool results must not be blocked by the display budget.
+   Only the display is shortened; raw messages and the journal stay intact. */
+static int mem_append_bounded(cJSON *session, const char *prefix, const char *text) {
+    static const char marker[] = "\r\n[Display truncated; full tool results remain in message history.]\r\n";
+    const char *old = mem_string(session, "transcript");
+    size_t a = old ? strlen(old) : 0, b = strlen(prefix), c = strlen(text);
+    size_t m = sizeof(marker) - 1, keep, offset;
+    char *joined;
+    int ok;
+    if (a + b + c <= TRANSCRIPT_MAX) return mem_append_limit(session, prefix, text, TRANSCRIPT_MAX);
+    c = mem_boundary(text, TRANSCRIPT_MAX - m - b);
+    keep = TRANSCRIPT_MAX - m - b - c;
+    offset = a > keep ? a - keep : 0;
+    while (offset < a && ((unsigned char)old[offset] & 0xc0) == 0x80) ++offset;
+    keep = a - offset;
+    joined = malloc(m + keep + b + c + 1);
+    if (!joined) return mem_fail("Not enough memory for the session transcript.");
+    memcpy(joined, marker, m);
+    if (keep) memcpy(joined + m, old + offset, keep);
+    memcpy(joined + m + keep, prefix, b);
+    memcpy(joined + m + keep + b, text, c);
+    joined[m + keep + b + c] = 0;
+    ok = mem_set(session, "transcript", joined);
+    free(joined); memory.dirty += m + b + c;
+    return ok;
+}
 static int mem_archive(const char *type, const char *text) {
     const char *kind = NULL, *title = NULL;
     char prefix[64];
@@ -215,6 +244,8 @@ static int mem_archive(const char *type, const char *text) {
     lstrcpynA(memory.kind, kind, sizeof(memory.kind));
     return (memory.dirty < 32768 && GetTickCount() - memory.flushed < 1000) || mem_save();
 }
+
+#include "recovery.inc"
 static int mem_path(const char *utf8, char *ansi, char *canonical) {
     WCHAR wide[MAX_PATH], full[MAX_PATH];
     DWORD length, attributes;
@@ -292,8 +323,8 @@ static int mem_init(void) {
     if (!memory.root || !mem_validate()) return mem_fail("Library is corrupt or has an unsupported format. It was not replaced; repair or restore data/library.json.");
     cJSON_ArrayForEach(session, cJSON_GetObjectItemCaseSensitive(memory.root, "sessions")) {
         if (cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(session, "pending"))) {
-            if (!mem_append_limit(session, "\r\n\r\n[Interrupted]\r\n", "Previous run ended before the turn completed. Completed context was restored.", TRANSCRIPT_MAX)) return 0;
-            cJSON_ReplaceItemInObjectCaseSensitive(session, "pending", cJSON_CreateBool(0)); recovery = 1;
+            if (!mem_finish_turn(session, "Previous run ended before the turn completed.")) return 0;
+            recovery = 1;
         }
     }
     return !recovery || mem_save();
@@ -438,14 +469,16 @@ static int mem_reset(struct conversation_t *convo) {
     cJSON_ReplaceItemInObjectCaseSensitive(memory.session, "messages", cJSON_CreateArray());
     mem_set(memory.session, "transcript", "");
     cJSON_ReplaceItemInObjectCaseSensitive(memory.session, "pending", cJSON_CreateBool(0));
+    cJSON_DeleteItemFromObjectCaseSensitive(memory.session, "turn");
     convo_clear(convo); memory.kind[0] = 0;
     if (!mem_save()) return 0;
     agent_emit("clear", NULL); agent_emit("status", "Conversation cleared."); mem_metadata(); return 1;
 }
 
 /* Clone before truncating tool output. IDs, arguments and reasoning remain exact. */
-static int mem_turn_begin(const char *text) {
+static int mem_turn_begin(struct conversation_t *convo, const char *text) {
     char title[81];
+    cJSON *turn;
     size_t length;
     int automatic = 0;
     if (!mem_append(memory.session, "\r\n\r\nYou:\r\n", text)) return 0;
@@ -456,26 +489,24 @@ static int mem_turn_begin(const char *text) {
         if (length) { mem_set(memory.session, "title", title); automatic = 1; }
     }
     cJSON_ReplaceItemInObjectCaseSensitive(memory.session, "pending", cJSON_CreateBool(1));
+    cJSON_DeleteItemFromObjectCaseSensitive(memory.session, "turn");
+    turn = cJSON_AddObjectToObject(memory.session, "turn");
+    if (!turn || !cJSON_AddArrayToObject(turn, "messages") || !cJSON_AddArrayToObject(turn, "tools"))
+        return mem_fail("Not enough memory to begin a durable turn.");
+    memory.turn_start = cJSON_GetArraySize(convo->messages);
+    convo_add_text_message(convo, "user", text);
     memory.kind[0] = 0;
     if (!mem_catalog_fits()) {
         if (automatic) mem_set(memory.session, "title", "New chat");
         if (!mem_catalog_fits()) return 0;
     }
-    if (!mem_save()) return 0;
+    if (!mem_checkpoint(convo)) return 0;
     mem_metadata(); mem_catalog(); return 1;
 }
 static int mem_turn_end(struct conversation_t *convo, int success) {
-    cJSON *raw;
     if (memory.failed) return 0;
-    if (success) {
-        raw = cJSON_Duplicate(convo->messages, 1);
-        if (!raw) return mem_fail("Not enough memory to preserve completed history.");
-        cJSON_Delete(cJSON_DetachItemFromArray(raw, 0));
-        if (!mem_messages(raw)) { cJSON_Delete(raw); return mem_fail("Completed conversation has an invalid tool chain; previous context was retained."); }
-        cJSON_ReplaceItemInObjectCaseSensitive(memory.session, "messages", raw);
-    }
-    cJSON_ReplaceItemInObjectCaseSensitive(memory.session, "pending", cJSON_CreateBool(0));
-    return mem_save();
+    return mem_checkpoint(convo) && mem_finish_turn(memory.session,
+        success ? NULL : "Task stopped or failed. Recorded tool results were retained.") && mem_save();
 }
 static cJSON *mem_projection_copy(cJSON *source) {
     cJSON *copy = cJSON_Duplicate(source, 1);

@@ -18,10 +18,15 @@
 #pragma comment(lib, "libcurl")
 
 /* Define DEBUG_REQUESTS / DEBUG_TOOLS explicitly for opt-in sensitive logs. */
-static HANDLE agent_pipe = INVALID_HANDLE_VALUE, agent_parent = NULL;
+static HANDLE agent_pipe = INVALID_HANDLE_VALUE, agent_parent = NULL, agent_cancel = NULL;
 static int agent_broken;
 static void agent_emit(const char *type, const char *text);
+static void agent_send(const char *type, const char *text);
 static int mem_utf8(const char *text);
+struct conversation_t;
+struct config_t;
+static char *agent_tool_begin(struct conversation_t *convo, struct config_t *config, cJSON *call);
+static int agent_tool_end(struct conversation_t *convo, const char *result);
 
 //////////////////////////////////////////////////////////////////////////
 //
@@ -143,6 +148,7 @@ void term_init(void) {
 
 int term_interrupted(void) {
     return term_interrupted_flag != 0 || agent_broken ||
+        (agent_cancel && WaitForSingleObject(agent_cancel, 0) == WAIT_OBJECT_0) ||
         (agent_parent && WaitForSingleObject(agent_parent, 0) == WAIT_OBJECT_0);
 }
 
@@ -214,6 +220,7 @@ static size_t http_write_callback(char *data, size_t size, size_t nmemb, void *u
 }
 
 static int http_progress_callback(void *clientp, double dltotal, double dlnow, double ultotal, double ulnow) {
+    (void)clientp; (void)dltotal; (void)dlnow; (void)ultotal; (void)ulnow;
     return term_interrupted();
 }
 
@@ -278,18 +285,18 @@ const struct tool_params_t run_cmd_params[] = {
         "command",
         "string",
         "Command passed to Windows XP cmd.exe /D /C, limited to about 4000 characters. "
-        "Use one command per call and join dependent steps with &&; run independent calls in parallel. "
+        "Use one command per call and join dependent steps with &&; calls execute sequentially. "
         "Use call \"file.bat\" when running a batch file before another command. "
         "Use only Windows XP-compatible tools; do not use PowerShell, Python, Perl, package managers, or newer Windows commands. "
-        "busybox.exe provides sh, find, grep, sed, awk, cat, head, tail, diff, patch, tee, and unix2dos. "
+        "When detected in the system environment profile, busybox.exe provides sh, find, grep, sed, awk, cat, head, tail, diff, patch, tee, and unix2dos. "
         "Use forward-slash paths and short POSIX options with BusyBox; GNU long options such as --include are unsupported. Scope searches and cap their output. "
         "For pipes, regexes, or difficult quoting, run busybox.exe sh and pass the script in stdin. "
         "For edits, pass a unified diff to busybox.exe patch -p1 in stdin and verify the result; malformed hunks can exit successfully without applying. "
         "Do not retry a failed patch unchanged or convert CRLF before patching. "
         "patch, tee, and sed -i write LF, so restore existing CRLF files with unix2dos. "
         "Use tee and stdin for whole-file writes. "
-        "jq.exe is available for parsing and transforming JSON; prefer it to grep or sed for JSON; use jq -r when plain-text output is needed. "
-        "curl.exe is available for networking. If EXA_API_KEY is set, use Exa to search and fetch web pages. "
+        "When detected, use jq.exe for JSON and curl.exe for networking; these are bundled tools, not XP system commands. "
+        "If EXA_API_KEY is set, use Exa to search and fetch web pages. "
         "Post JSON on stdin to https://api.exa.ai/search or https://api.exa.ai/contents with curl.exe -s, Content-Type and x-api-key headers, and -d @-. "
         "Use /search to discover pages; nest highlights or text under contents. Use /contents to fetch known URLs; highlights and text are top-level. "
         "Prefer highlights for lookups, or text with maxCharacters for deeper reading. Set maxAgeHours to 0 only when fresh content matters.",
@@ -314,6 +321,17 @@ const struct tool_t tools[] = {
     },
     {NULL, NULL, NULL}
 };
+
+/* Drain output while stdin is written: a full pipe must not block Stop. */
+struct cmd_input_t { HANDLE pipe; const char *text; DWORD size; };
+static DWORD WINAPI cmd_write_input(void *data) {
+    struct cmd_input_t *input = data;
+    DWORD written, at = 0;
+    while (at < input->size && WriteFile(input->pipe, input->text + at, input->size - at, &written, NULL) && written)
+        at += written;
+    CloseHandle(input->pipe);
+    return 0;
+}
 
 char *tool_handle_run_cmd(const char *cwd, const char *cmd, const char *input) {
     // rough idea is that we create pipes to read cmd.exe's stdout/err and pipe in stdin.
@@ -346,21 +364,22 @@ char *tool_handle_run_cmd(const char *cwd, const char *cmd, const char *input) {
 } while (0)
 
     SECURITY_ATTRIBUTES sa = {sizeof(SECURITY_ATTRIBUTES), NULL, TRUE};
-    HANDLE outread = NULL, outwrite = NULL, inread = NULL, inwrite = NULL, job;
+    HANDLE outread = NULL, outwrite = NULL, inread = NULL, inwrite = NULL, job, writer = NULL;
+    struct cmd_input_t input_data;
     STARTUPINFO si = {0};
     PROCESS_INFORMATION pi = {0};
     JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits = {0};
     char cmdpath[MAX_PATH];
     char *cmdline, buf[1024], *out;
     size_t outsize = 4096, outlen = 0;
-    DWORD readlen, exitcode = STILL_ACTIVE, started;
+    DWORD exitcode = STILL_ACTIVE, started;
     BOOL ok;
 
     if (!CreatePipe(&outread, &outwrite, &sa, 0)) return strdup("Cannot create output pipe.");
     SetHandleInformation(outread, HANDLE_FLAG_INHERIT, 0);
 
     if (input) {
-        if (!CreatePipe(&inread, &inwrite, &sa, strlen(input) + 1)) {
+        if (!CreatePipe(&inread, &inwrite, &sa, 4096)) {
             CloseHandle(outread); CloseHandle(outwrite);
             return strdup("Cannot create input pipe.");
         }
@@ -416,14 +435,16 @@ char *tool_handle_run_cmd(const char *cwd, const char *cmd, const char *input) {
     ResumeThread(pi.hThread);
 
     if (input) {
-        WriteFile(inwrite, input, strlen(input), &readlen, NULL);
-        CloseHandle(inwrite);
+        input_data.pipe = inwrite; input_data.text = input; input_data.size = (DWORD)strlen(input);
+        writer = CreateThread(NULL, 0, cmd_write_input, &input_data, 0, NULL);
+        if (!writer) { CloseHandle(inwrite); TerminateJobObject(job, 8); }
     }
 
     out = malloc(outsize);
     if (!out) {
         TerminateJobObject(job, 8);
         CloseHandle(job); CloseHandle(pi.hProcess); CloseHandle(pi.hThread); CloseHandle(outread);
+        if (writer) { WaitForSingleObject(writer, INFINITE); CloseHandle(writer); }
         return strdup("Not enough memory for command output.");
     }
     for (;;) {
@@ -435,7 +456,7 @@ char *tool_handle_run_cmd(const char *cwd, const char *cmd, const char *input) {
         if (GetTickCount() - started >= CMD_TIMEOUT_MS) {
             exitcode = EXIT_TIMEOUT;
         } else if (term_interrupted()) {
-            term_interrupt_reset();
+            if (agent_pipe == INVALID_HANDLE_VALUE) term_interrupt_reset();
             exitcode = EXIT_INTERRUPT;
         }
         if (exitcode != STILL_ACTIVE) {
@@ -453,6 +474,7 @@ char *tool_handle_run_cmd(const char *cwd, const char *cmd, const char *input) {
     if (exitcode == STILL_ACTIVE) GetExitCodeProcess(pi.hProcess, &exitcode);
 
     CloseHandle(job);
+    if (writer) { WaitForSingleObject(writer, INFINITE); CloseHandle(writer); }
     CloseHandle(pi.hProcess);
     CloseHandle(pi.hThread);
 
@@ -490,7 +512,7 @@ char *tool_handle_run_cmd(const char *cwd, const char *cmd, const char *input) {
 
 char *tool_dispatch(struct config_t *config, const char *name, const char *args_json) {
     const char *cmd, *input = NULL;
-    char *out;
+    char *out = NULL;
     cJSON *command_json, *stdin_json, *args = cJSON_Parse(args_json);
     if (!name || strcmp(name, "cmd")) { cJSON_Delete(args); return strdup("Unknown tool."); }
     command_json = cJSON_GetObjectItemCaseSensitive(args, "command");
@@ -505,11 +527,9 @@ char *tool_dispatch(struct config_t *config, const char *name, const char *args_
 
     if (!strcmp(name, "cmd")) {
         cmd = cJSON_GetObjectItemCaseSensitive(args, "command")->valuestring;
-        agent_emit("tool", cmd);
 
         stdin_json = cJSON_GetObjectItemCaseSensitive(args, "stdin");
         if (cJSON_IsString(stdin_json)) input = stdin_json->valuestring;
-        if (input) agent_emit("tool_stdin", input);
         if (term_interrupted()) { cJSON_Delete(args); return strdup("Execution interrupted."); }
 
 #ifdef DEBUG_TOOLS
@@ -694,7 +714,7 @@ static double optional_number(cJSON *object, const char *key) {
 
 int convo_add_response(struct conversation_t *convo, const char *json) {
     cJSON *res, *choice, *msg, *err, *usage, *details, *finish;
-    cJSON *role, *content, *tc, *tcs, *func;
+    cJSON *role, *content, *tc, *tcs, *func, *prior;
     const char *error = "Malformed model response.";
     int has_tools = 0, ti, to;
     res = json ? cJSON_ParseWithOpts(json, NULL, 1) : NULL;
@@ -720,8 +740,10 @@ int convo_add_response(struct conversation_t *convo, const char *json) {
             role = cJSON_GetObjectItemCaseSensitive(tc, "id");
             content = cJSON_GetObjectItemCaseSensitive(func, "name");
             details = cJSON_GetObjectItemCaseSensitive(func, "arguments");
-            if (!cJSON_IsString(role) || !role->valuestring[0] || !cJSON_IsString(content) ||
+            if (!cJSON_IsString(role) || !role->valuestring[0] || strlen(role->valuestring) > 256 || !cJSON_IsString(content) ||
                 !content->valuestring[0] || !cJSON_IsString(details)) goto invalid;
+            for (prior = tcs->child; prior != tc; prior = prior->next)
+                if (!strcmp(cJSON_GetObjectItemCaseSensitive(prior, "id")->valuestring, role->valuestring)) goto invalid;
         }
         msg = cJSON_Duplicate(msg, cJSON_True);
         if (!msg) goto invalid;
@@ -779,7 +801,9 @@ void convo_handle_tool_calls(struct conversation_t *convo, struct config_t *conf
         name = cJSON_GetObjectItemCaseSensitive(func, "name")->valuestring;
         args_json = cJSON_GetObjectItemCaseSensitive(func, "arguments")->valuestring;
  
-        content = tool_dispatch(config, name, args_json);
+        content = agent_tool_begin(convo, config, tc);
+        if (!content && !term_interrupted()) content = tool_dispatch(config, name, args_json);
+        if (!content) content = strdup("Not executed: task interrupted before command launch.");
         /* cmd utilities may return OEM bytes. Keep desktop history valid UTF-8. */
         if (agent_pipe != INVALID_HANDLE_VALUE && content && !mem_utf8(content)) {
             count = MultiByteToWideChar(CP_OEMCP, 0, content, -1, NULL, 0);
@@ -799,9 +823,11 @@ void convo_handle_tool_calls(struct conversation_t *convo, struct config_t *conf
         if (agent_pipe == INVALID_HANDLE_VALUE && content) {
             printf("[Tool result: %s]\n", id); term_write_utf8(content); printf("\n"); fflush(stdout);
         }
-        if (content) agent_emit("tool_result", content);
         convo_add_tool_message(convo, id, content);
+        if (!agent_tool_end(convo, content)) { free(content); break; }
+        agent_send("tool_result", content); /* Already archived by agent_tool_end. */
         free(content);
+        if (term_interrupted()) break;
     }
 
     convo->pending_tool_msg = NULL;
@@ -910,9 +936,14 @@ const char *sysprompt =
     "You are XP-Harness-Desktop, an AI agent that gets things done on this machine. "
     "Reply in the user's language. "
     "Be concise and practical, using short paragraphs and lists only when useful. "
-    "Suggest only Windows XP-compatible commands and methods. "
-    "Run independent tool calls in parallel and batch related commands into one call. "
-    "Do not re-read files or re-run commands whose output you already have unless something changed.";
+    "Compatibility target: Windows XP SP3 x86, even when the actual host is newer. "
+    "Use only XP-compatible commands and methods through cmd.exe /D /C; calls run sequentially. "
+    "Do not assume PowerShell, Python, Perl, winget, WSL, package managers, or modern Windows commands exist. "
+    "curl, jq and sh are not XP built-ins. Use only detected bundled tools, using their quoted absolute paths below. "
+    "If a required tool is missing, explain the limitation instead of silently installing software. "
+    "Desktop commands require user approval; a rejection is a tool result, not permission to try a bypass. "
+    "Do not re-run commands whose results are already recorded. Interrupted commands can have partial effects. "
+    "An unknown execution outcome requires user verification before any retry; never automatically repeat it.";
 
 static int prompt_append(char *buf, int pos, const char *fmt, ...) {
     int written, available = SYSPROMPT_MAX - pos;
@@ -934,6 +965,33 @@ static const char *path_utf8(const char *path, char *utf8) {
     return utf8;
 }
 
+static int prompt_environment(char *buf, int n) {
+    OSVERSIONINFOA version;
+    char directory[MAX_PATH], path[MAX_PATH], utf8[MAX_PATH * 3], *slash;
+    const char *names[] = {"busybox.exe", "jq.exe", "curl.exe"};
+    DWORD length, attributes;
+    int i;
+    memset(&version, 0, sizeof(version)); version.dwOSVersionInfoSize = sizeof(version);
+    if (GetVersionExA(&version)) n = prompt_append(buf, n, "\nReported host Windows version: %lu.%lu build %lu (does not relax the XP compatibility target).",
+        version.dwMajorVersion, version.dwMinorVersion, version.dwBuildNumber);
+    n = prompt_append(buf, n, "\nCommand/input encoding: Windows ANSI code page %u; output fallback: OEM code page %u. Prefer ASCII commands.\nDetected bundled tools (file presence only; versions not verified):", GetACP(), GetOEMCP());
+    length = GetModuleFileNameA(NULL, directory, MAX_PATH);
+    slash = length && length < MAX_PATH ? strrchr(directory, '\\') : NULL;
+    if (slash) *slash = 0;
+    for (i = 0; i < 3; ++i) {
+        attributes = INVALID_FILE_ATTRIBUTES;
+        if (slash && strlen(directory) + strlen(names[i]) + 2 < MAX_PATH) {
+            sprintf(path, "%s\\%s", directory, names[i]); attributes = GetFileAttributesA(path);
+        }
+        if (attributes != INVALID_FILE_ATTRIBUTES && !(attributes & FILE_ATTRIBUTE_DIRECTORY))
+            n = prompt_append(buf, n, "\n%s: \"%s\"", names[i], path_utf8(path, utf8));
+        else n = prompt_append(buf, n, "\n%s: not detected beside AgentCore.exe; do not assume it is available.", names[i]);
+    }
+    length = GetSystemDirectoryA(path, MAX_PATH);
+    if (length && length < MAX_PATH - 9) { strcat(path, "\\cmd.exe"); n = prompt_append(buf, n, "\nCommand interpreter: \"%s\" /D /C\n", path_utf8(path, utf8)); }
+    return n;
+}
+
 void convo_add_sysprompt(struct conversation_t *convo, struct config_t *config) {
     char buf[SYSPROMPT_MAX];
     char utf8[MAX_PATH * 3];
@@ -944,7 +1002,8 @@ void convo_add_sysprompt(struct conversation_t *convo, struct config_t *config) 
     FILE *f;
 
     // add base sysprompt + cwd
-    n = prompt_append(buf, 0, "%s\nCurrent directory: %s\nCurrent directory contents:", sysprompt, path_utf8(config->cwd, utf8));
+    n = prompt_environment(buf, prompt_append(buf, 0, "%s", sysprompt));
+    n = prompt_append(buf, n, "\nCurrent directory: %s\nCurrent directory contents:", path_utf8(config->cwd, utf8));
     
     // add cwd content
     _snprintf(path, sizeof(path), "%s\\*", config->cwd);
